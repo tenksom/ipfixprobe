@@ -123,6 +123,14 @@ struct RecordExtQUIC : public RecordExt {
 	bool client_hello_seen;
 	bool packet_from_server_seen;
 
+	struct CryptoSegment {
+		uint64_t offset;
+		std::vector<uint8_t> data;
+	};
+	std::vector<CryptoSegment> crypto_segments;
+	uint64_t crypto_total_expected = 0;
+	bool crypto_buffer_complete = false;
+
 	RecordExtQUIC(int pluginID)
 		: RecordExt(pluginID)
 	{
@@ -352,7 +360,7 @@ struct RecordExtQUIC : public RecordExt {
 			out << std::hex << std::setw(2) << std::setfill('0') << (uint16_t) tls_ext[i];
 		}
 		out << "\"";
-
+		out << "quictlsreassambled=\"" << crypto_buffer_complete << "\"";
 		return out.str();
 	}
 };

@@ -987,11 +987,12 @@ inline void QUICParser::quic_copy_crypto(uint8_t* start, const uint8_t* end, uin
 		return;
 	}
 
-	frame_offset = std::min(frame_offset, (uint32_t) (CURRENT_BUFFER_SIZE - 1));
-	frame_length = std::min((uint32_t) (CURRENT_BUFFER_SIZE - 1 - frame_offset), frame_length);
+	frame_offset = std::min(frame_offset, (uint32_t) (QUIC_REASSEMBLE_BUFFER_SIZE - 1));
+	frame_length = std::min((uint32_t) (QUIC_REASSEMBLE_BUFFER_SIZE - 1 - frame_offset), frame_length);
 	// avoid memory overlap in memcpy when not enought space in source buffer
 	frame_length = std::min(frame_length, (uint32_t) (end - (start + offset)));
 
+	m_crypto_chunks.push_back({frame_offset, (uint16_t) frame_length, start + offset});
 	memcpy(assembled_payload + frame_offset, start + offset, frame_length);
 	if (frame_offset < quic_crypto_start) {
 		quic_crypto_start = frame_offset;
@@ -1005,6 +1006,7 @@ bool QUICParser::quic_reassemble_frames()
 {
 	quic_crypto_start = UINT16_MAX;
 	quic_crypto_len = 0;
+	m_crypto_chunks.clear();
 
 	uint64_t offset = 0;
 	uint8_t* payload_end = decrypted_payload + payload_len;
@@ -1359,7 +1361,12 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 
 		if (!quic_set_server_port(pkt)) {
 			DEBUG_MSG("Error, extracting server port");
-			return false;
+			// For Initial packets without a parsed TLS handshake (e.g., the second UDP datagram of
+			// a fragmented ClientHello), the server port cannot be determined yet. Do not abort;
+			// it will be set once the assembled CRYPTO buffer is fully parsed.
+			if (packet_type != INITIAL || parsed_initial) {
+				return false;
+			}
 		}
 
 		if (packet_type == RETRY) {
@@ -1466,6 +1473,29 @@ bool QUICParser::quic_parse_initial(
 		parsed_client_hello = true;
 	}
 
+	return true;
+}
+
+void QUICParser::quic_get_crypto_chunks(std::vector<CryptoChunk>& out)
+{
+	out = m_crypto_chunks;
+}
+
+bool QUICParser::quic_parse_tls_from_assembled(const uint8_t* buf, uint16_t len, const Packet& pkt)
+{
+	if (!tls_parser.parse_quic_tls(buf, len)) {
+		return false;
+	}
+	if (!quic_parse_tls_extensions()) {
+		return false;
+	}
+	parsed_initial = 1;
+	if (!quic_set_server_port(pkt)) {
+		return false;
+	}
+	if (tls_hs_type == TLS_HANDSHAKE_CLIENT_HELLO) {
+		parsed_client_hello = true;
+	}
 	return true;
 }
 

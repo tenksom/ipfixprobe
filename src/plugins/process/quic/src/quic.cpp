@@ -17,6 +17,9 @@
 #include <unirec/unirec.h>
 #endif
 
+#include <algorithm>
+#include <cstring>
+
 #include <ipfixprobe/pluginFactory/pluginManifest.hpp>
 #include <ipfixprobe/pluginFactory/pluginRegistrar.hpp>
 
@@ -347,6 +350,25 @@ void QUICPlugin::set_packet_type(RecordExtQUIC* quic_data, Flow& rec, uint8_t pa
 	}
 }
 
+static bool is_crypto_buffer_complete(const std::vector<RecordExtQUIC::CryptoSegment>& segs)
+{
+	if (segs.empty() || segs[0].offset != 0 || segs[0].data.size() < 4) {
+		return false;
+	}
+	uint64_t covered = 0;
+	for (const auto& seg : segs) {
+		if (seg.offset > covered) {
+			return false;
+		}
+		covered = std::max(covered, seg.offset + (uint64_t) seg.data.size());
+	}
+	// Read the 3-byte big-endian TLS handshake body length from bytes 1-3
+	const uint8_t* hdr = segs[0].data.data();
+	uint32_t tls_body_len = ((uint32_t) hdr[1] << 16) | ((uint32_t) hdr[2] << 8) | hdr[3];
+	uint64_t total_expected = 4 + tls_body_len;
+	return total_expected <= QUIC_REASSEMBLE_BUFFER_SIZE && covered >= total_expected;
+}
+
 int QUICPlugin::process_quic(
 	RecordExtQUIC* quic_data,
 	Flow& rec,
@@ -354,7 +376,6 @@ int QUICPlugin::process_quic(
 	bool new_quic_flow)
 {
 	QUICParser process_quic;
-
 	// Test for QUIC LH packet in UDP payload
 	if (process_quic.quic_check_quic_long_header_packet(
 			pkt,
@@ -414,6 +435,58 @@ int QUICPlugin::process_quic(
 				process_quic.quic_get_dcid_len(quic_data->initial_dcid_length);
 				process_quic.quic_get_dcid(quic_data->initial_dcid);
 				// Once established it can only be changed by a retry packet.
+			}
+
+			// Multi-packet ClientHello reassembly: accumulate CRYPTO chunks when the single-packet
+			// TLS parse failed (fragmented ClientHello spread across multiple Initial packets).
+			if (!parsed_initial && !quic_data->client_hello_seen
+				&& !quic_data->crypto_buffer_complete && toServer != 0) {
+				std::vector<CryptoChunk> chunks;
+				process_quic.quic_get_crypto_chunks(chunks);
+				for (const auto& chunk : chunks) {
+					// Skip chunks that would overflow the assembly buffer
+					if (chunk.offset + chunk.length > QUIC_REASSEMBLE_BUFFER_SIZE) {
+						continue;
+					}
+					// Deduplicate by offset (retransmissions send same data)
+					bool duplicate = false;
+					for (const auto& seg : quic_data->crypto_segments) {
+						if (seg.offset == chunk.offset) {
+							duplicate = true;
+							break;
+						}
+					}
+					if (!duplicate) {
+						quic_data->crypto_segments.push_back(
+							{chunk.offset,
+							 std::vector<uint8_t>(chunk.data, chunk.data + chunk.length)});
+					}
+				}
+
+				std::sort(
+					quic_data->crypto_segments.begin(),
+					quic_data->crypto_segments.end(),
+					[](const RecordExtQUIC::CryptoSegment& a,
+					   const RecordExtQUIC::CryptoSegment& b) { return a.offset < b.offset; });
+
+				if (is_crypto_buffer_complete(quic_data->crypto_segments)) {
+					quic_data->crypto_buffer_complete = true;
+					uint8_t assembled[QUIC_REASSEMBLE_BUFFER_SIZE] = {0};
+					uint16_t total_len = 0;
+					for (const auto& seg : quic_data->crypto_segments) {
+						uint64_t end_pos = seg.offset + seg.data.size();
+						if (end_pos > QUIC_REASSEMBLE_BUFFER_SIZE) {
+							continue;
+						}
+						memcpy(assembled + seg.offset, seg.data.data(), seg.data.size());
+						if (end_pos > total_len) {
+							total_len = (uint16_t) end_pos;
+						}
+					}
+					if (process_quic.quic_parse_tls_from_assembled(assembled, total_len, pkt)) {
+						parsed_initial = 1;
+					}
+				}
 			}
 
 			if (parsed_initial && (process_quic.quic_get_tls_hs_type() == 1)) {
