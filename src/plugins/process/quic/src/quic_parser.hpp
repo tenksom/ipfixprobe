@@ -16,6 +16,7 @@
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <tlsParser/tls_parser.hpp>
+#include <vector>
 
 #define HASH_SHA2_256_LENGTH 32
 #define TLS13_AEAD_NONCE_LENGTH 12
@@ -43,6 +44,7 @@
 #define MAX_HEADER_LEN 67 + 256
 #define BUFF_SIZE 255
 #define CURRENT_BUFFER_SIZE 1500
+#define QUIC_REASSEMBLE_BUFFER_SIZE 2000
 // 8 because (1B QUIC LH, 4B Version, 1 B SCID LEN, 1B DCID LEN, Payload/Retry Token/Supported
 // Version >= 1 B)
 #define QUIC_MIN_PACKET_LENGTH 8
@@ -67,6 +69,12 @@ typedef struct Initial_Secrets {
 	uint8_t iv[TLS13_AEAD_NONCE_LENGTH];
 	uint8_t hp[AES_128_KEY_LENGTH];
 } Initial_Secrets;
+
+struct CryptoChunk {
+	uint64_t offset;
+	uint16_t length;
+	const uint8_t* data;
+};
 
 class QUICParser {
 private:
@@ -159,8 +167,8 @@ private:
 
 	uint8_t pkn_len;
 
-	uint8_t decrypted_payload[CURRENT_BUFFER_SIZE];
-	uint8_t assembled_payload[CURRENT_BUFFER_SIZE];
+	uint8_t decrypted_payload[QUIC_REASSEMBLE_BUFFER_SIZE];
+	uint8_t assembled_payload[QUIC_REASSEMBLE_BUFFER_SIZE];
 	uint8_t tmp_header_mem[MAX_HEADER_LEN];
 	uint8_t* final_payload;
 	uint8_t zero_rtt;
@@ -188,6 +196,7 @@ private:
 	uint16_t quic_crypto_start;
 	uint16_t quic_crypto_len;
 	TLSParser tls_parser;
+	std::vector<CryptoChunk> m_crypto_chunks;
 
 	uint8_t packets;
 
@@ -291,6 +300,8 @@ public:
 	void quic_get_tls_extension_lengths(uint16_t* tls_extensions_len);
 	void quic_get_tls_extension_lengths_len(uint8_t& tls_extensions_length_len_toset);
 	void quic_get_tls_extensions(char* in);
+	void quic_get_crypto_chunks(std::vector<CryptoChunk>& out);
+	bool quic_parse_tls_from_assembled(const uint8_t* buf, uint16_t len, const Packet& pkt);
 };
 
 } // namespace ipxp
