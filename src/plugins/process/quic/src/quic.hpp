@@ -124,7 +124,14 @@ struct RecordExtQUIC : public RecordExt {
 	bool packet_from_server_seen;
 
 	uint8_t crypto_buffer[QUIC_REASSEMBLE_BUFFER_SIZE];
-	uint64_t crypto_buffer_filled = 0;
+
+	static constexpr uint8_t MAX_CRYPTO_RANGES = 16;
+	struct CryptoRange {
+		uint64_t offset;
+		uint64_t end;
+	};
+	CryptoRange crypto_ranges[MAX_CRYPTO_RANGES];
+	uint8_t crypto_range_count = 0;
 	bool crypto_buffer_complete = false;
 
 	RecordExtQUIC(int pluginID)
@@ -159,7 +166,7 @@ struct RecordExtQUIC : public RecordExt {
 		memset(pkt_types, 0, sizeof(pkt_types));
 
 		memset(crypto_buffer, 0, sizeof(crypto_buffer));
-		crypto_buffer_filled = 0;
+		crypto_range_count = 0;
 
 		memset(tls_ext_type, 0, sizeof(tls_ext_type));
 		tls_ext_type_len = 0;
