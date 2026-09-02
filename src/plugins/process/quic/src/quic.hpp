@@ -125,7 +125,7 @@ struct RecordExtQUIC : public RecordExt {
 
 	uint8_t crypto_buffer[QUIC_REASSEMBLE_BUFFER_SIZE];
 
-	static constexpr uint8_t MAX_CRYPTO_RANGES = 16;
+	static constexpr uint8_t MAX_CRYPTO_RANGES = 32;
 	struct CryptoRange {
 		uint64_t offset;
 		uint64_t end;

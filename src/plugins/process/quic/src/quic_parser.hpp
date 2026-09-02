@@ -73,7 +73,10 @@ typedef struct Initial_Secrets {
 struct CryptoChunk {
 	uint64_t offset;
 	uint16_t length;
-	const uint8_t* data;
+	// Owns a copy of the bytes: a same-packet retry (e.g. the session-resumption DCID fallback
+	// in quic_parse_headers()) re-decrypts into the shared decrypted_payload buffer and would
+	// otherwise silently corrupt a chunk captured by an earlier, successful attempt.
+	std::vector<uint8_t> data;
 };
 
 class QUICParser {

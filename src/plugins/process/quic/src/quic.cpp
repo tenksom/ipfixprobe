@@ -459,7 +459,7 @@ int QUICPlugin::process_quic(
 					if (chunk.offset + chunk.length > QUIC_REASSEMBLE_BUFFER_SIZE) {
 						continue;
 					}
-					memcpy(quic_data->crypto_buffer + chunk.offset, chunk.data, chunk.length);
+					memcpy(quic_data->crypto_buffer + chunk.offset, chunk.data.data(), chunk.length);
 					if (quic_data->crypto_range_count < RecordExtQUIC::MAX_CRYPTO_RANGES) {
 						quic_data->crypto_ranges[quic_data->crypto_range_count++]
 							= {chunk.offset, chunk.offset + chunk.length};
