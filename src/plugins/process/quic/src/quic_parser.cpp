@@ -992,7 +992,8 @@ inline void QUICParser::quic_copy_crypto(uint8_t* start, const uint8_t* end, uin
 	// avoid memory overlap in memcpy when not enought space in source buffer
 	frame_length = std::min(frame_length, (uint32_t) (end - (start + offset)));
 
-	m_crypto_chunks.push_back({frame_offset, (uint16_t) frame_length, start + offset});
+	std::vector<uint8_t> chunk_data(start + offset, start + offset + frame_length);
+	m_crypto_chunks.push_back({frame_offset, (uint16_t) frame_length, std::move(chunk_data)});
 	memcpy(assembled_payload + frame_offset, start + offset, frame_length);
 	if (frame_offset < quic_crypto_start) {
 		quic_crypto_start = frame_offset;
@@ -1384,12 +1385,15 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 
 bool QUICParser::quic_set_server_port(const Packet& pkt)
 {
-	if (!tls_parser.get_handshake().has_value()) {
-		return false;
-	}
-
 	switch (packet_type) {
 	case INITIAL:
+		// Only the Initial packet's direction depends on the TLS handshake type (CH vs SH). A
+		// ClientHello fragmented across multiple Initial packets leaves the TLS parser without a
+		// handshake here for the non-final fragments; the caller tolerates that (see
+		// quic_parse_headers()). Packets of other types must not be penalized for it below.
+		if (!tls_parser.get_handshake().has_value()) {
+			return false;
+		}
 		tls_hs_type = tls_parser.get_handshake()->type;
 		if (tls_hs_type == 1) {
 			server_port = pkt.dst_port;
