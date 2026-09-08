@@ -270,7 +270,13 @@ void QUICPlugin::set_client_hello_fields(
 	(void) rec;
 	(void) pkt;
 
-	process_quic->quic_get_token_length(quic_data->quic_token_length);
+	// Only adopt the token length from the packet that completed the ClientHello if it was not
+	// already captured from an earlier Initial (see process_quic()). The final CRYPTO fragment of
+	// a split ClientHello may carry an empty token and must not overwrite the real value.
+	if (quic_data->quic_token_length
+		== QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT) {
+		process_quic->quic_get_token_length(quic_data->quic_token_length);
+	}
 	char dcid[MAX_CID_LEN] = {0};
 	uint8_t dcid_len = 0;
 	// since this is a client hello the dcid must be set
@@ -447,6 +453,19 @@ int QUICPlugin::process_quic(
 			if (quic_data->initial_dcid_length == 0) {
 				process_quic.quic_get_dcid_len(quic_data->initial_dcid_length);
 				process_quic.quic_get_dcid(quic_data->initial_dcid);
+			}
+
+			// Capture the token length from the first client->server Initial of the flow. RFC 9000
+			// only says a client SHOULD repeat the NEW_TOKEN/Retry token in every Initial, so a
+			// later CRYPTO-continuation fragment of a split ClientHello may carry an empty token.
+			// Recording it here - rather than only once the ClientHello finishes parsing
+			// (set_client_hello_fields()) - keeps the real value for reassembled ClientHellos and
+			// stops the uninitialized sentinel from being exported for flows whose ClientHello
+			// never reassembles. Retry packets set the token length separately below.
+			if (toServer != 0 && quic_data->cnt_retry_packets == 0
+				&& quic_data->quic_token_length
+					== QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT) {
+				process_quic.quic_get_token_length(quic_data->quic_token_length);
 			}
 
 			// Multi-packet ClientHello reassembly: accumulate CRYPTO chunks when the single-packet
