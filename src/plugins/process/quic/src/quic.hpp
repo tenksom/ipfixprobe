@@ -195,6 +195,17 @@ struct RecordExtQUIC : public RecordExt {
 		packet_from_server_seen = false;
 	}
 
+	// quic_token_length keeps QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT as an
+	// internal "token length not observed yet" marker (see process_quic()). That sentinel must
+	// never reach the wire - a consumer would read it as a bogus length (e.g. its low 32 bits,
+	// 4294967295). Emit 0 instead, which matches "no token present".
+	uint64_t exported_token_length() const
+	{
+		return quic_token_length == QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT
+			? 0
+			: quic_token_length;
+	}
+
 #ifdef WITH_NEMEA
 	virtual void fill_unirec(ur_template_t* tmplt, void* record)
 	{
@@ -202,7 +213,7 @@ struct RecordExtQUIC : public RecordExt {
 		ur_set_string(tmplt, record, F_QUIC_USER_AGENT, user_agent);
 		ur_set(tmplt, record, F_QUIC_VERSION, quic_version);
 		ur_set(tmplt, record, F_QUIC_CLIENT_VERSION, quic_client_version);
-		ur_set(tmplt, record, F_QUIC_TOKEN_LENGTH, quic_token_length);
+		ur_set(tmplt, record, F_QUIC_TOKEN_LENGTH, exported_token_length());
 		ur_set_var(tmplt, record, F_QUIC_OCCID, occid, occid_length);
 		ur_set_var(tmplt, record, F_QUIC_OSCID, oscid, oscid_length);
 		ur_set_var(tmplt, record, F_QUIC_SCID, scid, scid_length);
@@ -268,7 +279,7 @@ struct RecordExtQUIC : public RecordExt {
 		pos += len_version;
 		*(uint32_t*) (buffer + pos) = htonl(quic_client_version);
 		pos += len_client_version;
-		*(uint64_t*) (buffer + pos) = htobe64(quic_token_length);
+		*(uint64_t*) (buffer + pos) = htobe64(exported_token_length());
 		pos += len_token_length;
 		// original client connection ID
 		pos += variable2ipfix_buffer(buffer + pos, (uint8_t*) occid, occid_length);

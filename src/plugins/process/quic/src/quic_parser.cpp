@@ -1348,8 +1348,11 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 			offset += stored_payload_len;
 			break;
 		case RETRY:
-			// 16 - Integrity tag
-			token_length = pkt_payload_end - payload_pointer - offset - 16;
+			// Retry token = bytes between the header and the trailing 16-byte Retry Integrity Tag.
+			// offset is absolute from the datagram start; payload_pointer already embeds this
+			// iteration's start offset, so subtracting offset on top of it double-counts the start
+			// offset for a coalesced (non-first) Retry. Anchor on pkt_payload_pointer instead.
+			token_length = pkt_payload_end - (pkt_payload_pointer + offset) - 16;
 			if (!quic_check_pointer_pos((pkt_payload_pointer + offset), pkt_payload_end)) {
 				return false;
 			}
