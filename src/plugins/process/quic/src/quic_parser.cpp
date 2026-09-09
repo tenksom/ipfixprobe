@@ -401,6 +401,7 @@ bool QUICParser::quic_check_version(uint32_t version, uint8_t max_version)
 
 bool QUICParser::quic_obtain_version()
 {
+	const uint32_t previous_version = version;
 	version = quic_h1->version;
 	version = ntohl(version);
 	// this salt is used to draft 7-9
@@ -469,6 +470,9 @@ bool QUICParser::quic_obtain_version()
 		salt = handshake_salt_v2;
 	} else {
 		DEBUG_MSG("Error, version not supported\n");
+		// Keep the version parsed from an earlier (valid) packet instead of exporting the bytes
+		// of an unparsable coalesced segment.
+		version = previous_version;
 		return false;
 	}
 
@@ -1287,6 +1291,9 @@ bool QUICParser::quic_parse_header(
 	return true;
 }
 
+// Loops over the QUIC packets coalesced in one UDP datagram, parses each long header and (for the
+// first Initial) the ClientHello. Stops at the first packet it can't handle. Returns the packet-type
+// flags, 0 on failure.
 bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 {
 	(void) pkt;
@@ -1303,6 +1310,12 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 	uint64_t stored_payload_len;
 	while (pkt.payload + offset + QUIC_MIN_PACKET_LENGTH <= pkt.payload + pkt.payload_len) {
 		payload_pointer = pkt_payload_pointer + offset;
+
+		// An unknown version here means it's not another packet but datagram padding (picoquic
+		// pads with random bytes). Parsing it as a header would clobber the real version.
+		if (!quic_check_supported_version(ntohl(read_uint32_t(payload_pointer, 1)))) {
+			break;
+		}
 
 		if (!quic_parse_header(pkt, offset, pkt_payload_pointer, pkt_payload_end)) {
 			break;
