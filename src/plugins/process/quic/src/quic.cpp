@@ -283,8 +283,9 @@ void QUICPlugin::set_client_hello_fields(
 	process_quic->quic_get_dcid(dcid);
 	process_quic->quic_get_dcid_len(dcid_len);
 
-	if ((quic_data->quic_token_length
-		 != QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT)
+	if (quic_data->client_hello_seen
+		&& (quic_data->quic_token_length
+			!= QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT)
 		&& (quic_data->quic_token_length > 0)
 		&& ((quic_data->retry_scid_length == dcid_len)
 			|| ((!new_quic_flow) && (quic_data->retry_scid_length == dcid_len)))
