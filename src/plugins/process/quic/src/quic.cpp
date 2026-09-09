@@ -400,7 +400,8 @@ int QUICPlugin::process_quic(
 	if (process_quic.quic_check_quic_long_header_packet(
 			pkt,
 			quic_data->initial_dcid,
-			quic_data->initial_dcid_length)) {
+			quic_data->initial_dcid_length,
+			quic_data->quic_largest_initial_pn)) {
 		uint32_t version;
 		process_quic.quic_get_version(version);
 

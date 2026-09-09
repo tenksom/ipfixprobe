@@ -170,6 +170,12 @@ private:
 
 	uint8_t pkn_len;
 
+	// RFC 9000, Appendix A.3 full packet number reconstruction for the AEAD nonce.
+	// largest_initial_pn: largest client Initial packet number decrypted so far in the flow (-1 =
+	// none). current_initial_pn: full packet number of the Initial currently being decrypted.
+	int64_t largest_initial_pn;
+	int64_t current_initial_pn;
+
 	uint8_t decrypted_payload[QUIC_REASSEMBLE_BUFFER_SIZE];
 	uint8_t assembled_payload[QUIC_REASSEMBLE_BUFFER_SIZE];
 	uint8_t tmp_header_mem[MAX_HEADER_LEN];
@@ -285,7 +291,8 @@ public:
 	bool quic_check_quic_long_header_packet(
 		const Packet& pkt,
 		char* initial_packet_dcid,
-		uint8_t& initial_packet_dcid_length);
+		uint8_t& initial_packet_dcid_length,
+		int64_t& io_largest_initial_pn);
 	bool quic_parse_headers(const Packet&, bool forceInitialParsing);
 	bool quic_parse_header(
 		const Packet& pkt,

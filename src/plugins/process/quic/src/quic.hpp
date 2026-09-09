@@ -134,6 +134,9 @@ struct RecordExtQUIC : public RecordExt {
 	uint8_t crypto_range_count = 0;
 	bool crypto_buffer_complete = false;
 
+	// Largest client Initial packet number decrypted so far (RFC 9000, Appendix A.3). -1 = none yet.
+	int64_t quic_largest_initial_pn = -1;
+
 	RecordExtQUIC(int pluginID)
 		: RecordExt(pluginID)
 	{
