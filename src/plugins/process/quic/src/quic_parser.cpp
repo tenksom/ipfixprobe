@@ -59,6 +59,8 @@ QUICParser::QUICParser()
 	pkn_len = 0;
 	tls_hs_type = 0;
 	parsed_client_hello = false;
+	largest_initial_pn = -1;
+	current_initial_pn = -1;
 
 	memset(quic_tls_ext_type, 0, sizeof(quic_tls_ext_type));
 	quic_tls_ext_type_pos = 0;
@@ -835,15 +837,35 @@ bool QUICParser::quic_decrypt_initial_header(const uint8_t* payload_pointer, uin
 	for (unsigned int i = 0; i < pkn_len; i++) {
 		packet_number |= (full_pkn[i] ^ mask[1 + i]) << (8 * (pkn_len - 1 - i));
 	}
+	// The header (AEAD associated data) keeps the truncated on-wire packet number.
 	for (unsigned i = 0; i < pkn_len; i++) {
 		header[header_len - 1 - i] = (uint8_t) (packet_number >> (8 * i));
 	}
+
+	// Reconstruct the full packet number for the AEAD nonce (RFC 9000, Appendix A.3). Without
+	// this, a follow-up Initial carrying the tail of a fragmented ClientHello fails to decrypt
+	// once its truncated packet number has wrapped relative to the first Initial (e.g. a client
+	// that starts its Initial packet number well above zero).
+	uint64_t full_packet_number = packet_number;
+	if (largest_initial_pn >= 0 && pkn_len < 8) {
+		const uint64_t pn_win = (uint64_t) 1 << (pkn_len * 8);
+		const uint64_t pn_hwin = pn_win / 2;
+		const uint64_t expected_pn = (uint64_t) largest_initial_pn + 1;
+		full_packet_number = (expected_pn & ~(pn_win - 1)) | packet_number;
+		if (full_packet_number + pn_hwin <= expected_pn) {
+			full_packet_number += pn_win;
+		} else if (full_packet_number > expected_pn + pn_hwin && full_packet_number >= pn_win) {
+			full_packet_number -= pn_win;
+		}
+	}
+	current_initial_pn = (int64_t) full_packet_number;
+
 	// adjust nonce for payload decryption
 	// https://www.rfc-editor.org/rfc/rfc9001.html#name-aead-usage
 	//  The exclusive OR of the padded packet number and the IV forms the AEAD nonce
 	phton64(
 		initial_secrets.iv + sizeof(initial_secrets.iv) - 8,
-		pntoh64(initial_secrets.iv + sizeof(initial_secrets.iv) - 8) ^ packet_number);
+		pntoh64(initial_secrets.iv + sizeof(initial_secrets.iv) - 8) ^ full_packet_number);
 	return true;
 } // QUICPlugin::quic_decrypt_initial_header
 
@@ -1436,22 +1458,23 @@ bool QUICParser::quic_set_server_port(const Packet& pkt)
 bool QUICParser::quic_check_quic_long_header_packet(
 	const Packet& pkt,
 	char* initial_packet_dcid,
-	uint8_t& initial_packet_dcid_length)
+	uint8_t& initial_packet_dcid_length,
+	int64_t& io_largest_initial_pn)
 {
 	initial_dcid_len = initial_packet_dcid_length;
 	initial_dcid = (uint8_t*) initial_packet_dcid;
+	largest_initial_pn = io_largest_initial_pn;
 
 	quic_parse_quic_bit(pkt.payload[0]);
 
-	if (!quic_long_header_packet(pkt)) {
-		return false;
+	bool ok = quic_long_header_packet(pkt);
+	if (ok) {
+		quic_initialze_arrays();
+		ok = quic_parse_headers(pkt, false);
 	}
 
-	quic_initialze_arrays();
-	if (!quic_parse_headers(pkt, false)) {
-		return false;
-	}
-	return true;
+	io_largest_initial_pn = largest_initial_pn;
+	return ok;
 }
 
 bool QUICParser::quic_parse_initial(
@@ -1470,6 +1493,12 @@ bool QUICParser::quic_parse_initial(
 	if (!quic_decrypt_payload()) {
 		DEBUG_MSG("Error, payload decryption failed (client side)\n");
 		return false;
+	}
+	// AEAD verified: this Initial's packet number may now advance the reconstruction baseline
+	// (RFC 9000: "largest packet number successfully processed"). Doing this only after the tag
+	// check keeps a failed wrong-key attempt from poisoning the baseline.
+	if (current_initial_pn > largest_initial_pn) {
+		largest_initial_pn = current_initial_pn;
 	}
 	if (!quic_reassemble_frames()) {
 		DEBUG_MSG("Error, reassembling of crypto frames failed (client side)\n");
