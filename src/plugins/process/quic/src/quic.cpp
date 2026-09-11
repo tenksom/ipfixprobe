@@ -464,10 +464,26 @@ int QUICPlugin::process_quic(
 			// (set_client_hello_fields()) - keeps the real value for reassembled ClientHellos and
 			// stops the uninitialized sentinel from being exported for flows whose ClientHello
 			// never reassembles. Retry packets set the token length separately below.
-			if (toServer != 0 && quic_data->cnt_retry_packets == 0
-				&& quic_data->quic_token_length
-					== QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT) {
-				process_quic.quic_get_token_length(quic_data->quic_token_length);
+			//
+			// Adopt the observed value when nothing was captured yet, or when we only saw an
+			// empty token so far and this Initial carries a real one. The latter covers a single
+			// 5-tuple that carries two QUIC connections (e.g. a resumption handshake reusing the
+			// client port): the first connection's ClientHello has no token, the resumption one
+			// presents the NEW_TOKEN token, and that non-zero length is the value worth exporting.
+			// A non-zero capture is never downgraded to 0 by a later (possibly tokenless) Initial.
+			if (toServer != 0 && quic_data->cnt_retry_packets == 0) {
+				uint64_t observed_token_length
+					= QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT;
+				process_quic.quic_get_token_length(observed_token_length);
+				const bool nothing_captured_yet = quic_data->quic_token_length
+					== QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT;
+				const bool upgrades_empty_to_real
+					= quic_data->quic_token_length == 0 && observed_token_length > 0;
+				if (observed_token_length
+						!= QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT
+					&& (nothing_captured_yet || upgrades_empty_to_real)) {
+					quic_data->quic_token_length = observed_token_length;
+				}
 			}
 
 			// Multi-packet ClientHello reassembly: accumulate CRYPTO chunks when the single-packet
