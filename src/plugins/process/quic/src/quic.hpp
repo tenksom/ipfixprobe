@@ -74,6 +74,7 @@ struct RecordExtQUIC : public RecordExt {
 	uint8_t oscid_length;
 	uint8_t scid_length;
 	uint8_t initial_dcid_length;
+	uint8_t orig_dcid_length;
 	uint8_t dir_scid_length;
 	uint8_t dir_dcid_length;
 	uint8_t dir_scid_length2;
@@ -83,6 +84,10 @@ struct RecordExtQUIC : public RecordExt {
 	char oscid[MAX_CID_LEN] = {0};
 	char scid[MAX_CID_LEN] = {0};
 	char initial_dcid[MAX_CID_LEN] = {0};
+	// DCID of the very first Initial the client ever sent, unlike initial_dcid, this is never
+	// overwritten by a Retry (initial_dcid is repointed to the Retry's SCID for AEAD key
+	// derivation once a Retry is seen). Kept solely to export the correct OSCID.
+	char orig_dcid[MAX_CID_LEN] = {0};
 	char retry_scid[MAX_CID_LEN] = {0};
 	// Intermediate storage when direction is not clear
 	char dir_scid[MAX_CID_LEN] = {0};
@@ -118,6 +123,7 @@ struct RecordExtQUIC : public RecordExt {
 	bool occid_set;
 	bool oscid_set;
 	bool scid_set;
+	bool orig_dcid_set;
 
 	bool client_version_set;
 	bool client_hello_seen;
@@ -186,11 +192,14 @@ struct RecordExtQUIC : public RecordExt {
 		last_pkt_type = 0;
 		initial_dcid[0] = 0;
 		initial_dcid_length = 0;
+		orig_dcid[0] = 0;
+		orig_dcid_length = 0;
 		parsed_ch = 0;
 
 		occid_set = false;
 		oscid_set = false;
 		scid_set = false;
+		orig_dcid_set = false;
 		client_version_set = false;
 		cnt_retry_packets = 0;
 

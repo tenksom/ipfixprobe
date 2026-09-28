@@ -324,8 +324,20 @@ void QUICPlugin::set_client_hello_fields(
 			process_quic->quic_get_user_agent(quic_data->user_agent);
 
 			if (!quic_data->oscid_set) {
-				process_quic->quic_get_dcid(quic_data->oscid);
-				process_quic->quic_get_dcid_len(quic_data->oscid_length);
+				// OSCID is the DCID of the client's *first* Initial. When the ClientHello is
+				// fragmented across several Initials, the packet that completes reassembly can
+				// already carry the server-chosen DCID (RFC 9000 7.2: the client switches to the
+				// server's SCID once it has processed a server packet, and again after a Retry),
+				// so quic_get_dcid() here would return the wrong value. orig_dcid stashes the
+				// first observed Initial's DCID and - unlike initial_dcid - is never touched
+				// again, including across a Retry.
+				if (quic_data->orig_dcid_set) {
+					memcpy(quic_data->oscid, quic_data->orig_dcid, quic_data->orig_dcid_length);
+					quic_data->oscid_length = quic_data->orig_dcid_length;
+				} else {
+					process_quic->quic_get_dcid(quic_data->oscid);
+					process_quic->quic_get_dcid_len(quic_data->oscid_length);
+				}
 				quic_data->oscid_set = true;
 			}
 
@@ -456,10 +468,20 @@ int QUICPlugin::process_quic(
 				process_quic.quic_get_dcid_len(quic_data->initial_dcid_length);
 				process_quic.quic_get_dcid(quic_data->initial_dcid);
 			}
+			// Separately remember the DCID of the very first Initial permanently. Unlike
+			// initial_dcid above, a Retry (see PACKET_TYPE::RETRY below) repoints initial_dcid at
+			// the Retry's SCID so AEAD key derivation keeps working for the post-Retry Initial.
+			// OSCID export needs the original value, which orig_dcid_set protects from that
+			// overwrite.
+			if (!quic_data->orig_dcid_set) {
+				process_quic.quic_get_dcid_len(quic_data->orig_dcid_length);
+				process_quic.quic_get_dcid(quic_data->orig_dcid);
+				quic_data->orig_dcid_set = true;
+			}
 
-			// Capture the token length from the first client->server Initial of the flow. RFC 9000
-			// only says a client SHOULD repeat the NEW_TOKEN/Retry token in every Initial, so a
-			// later CRYPTO-continuation fragment of a split ClientHello may carry an empty token.
+			// Capture the token length from a client->server Initial of the flow. RFC 9000 only
+			// says a client SHOULD repeat the NEW_TOKEN/Retry token in every Initial, so a later
+			// CRYPTO-continuation fragment of a split ClientHello may carry an empty token.
 			// Recording it here - rather than only once the ClientHello finishes parsing
 			// (set_client_hello_fields()) - keeps the real value for reassembled ClientHellos and
 			// stops the uninitialized sentinel from being exported for flows whose ClientHello
@@ -477,11 +499,9 @@ int QUICPlugin::process_quic(
 				process_quic.quic_get_token_length(observed_token_length);
 				const bool nothing_captured_yet = quic_data->quic_token_length
 					== QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT;
-				const bool upgrades_empty_to_real
-					= quic_data->quic_token_length == 0 && observed_token_length > 0;
 				if (observed_token_length
 						!= QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT
-					&& (nothing_captured_yet || upgrades_empty_to_real)) {
+					&& (nothing_captured_yet || observed_token_length > 0)) {
 					quic_data->quic_token_length = observed_token_length;
 				}
 			}
@@ -566,8 +586,9 @@ int QUICPlugin::process_quic(
 				// Additionally set token len
 				process_quic.quic_get_scid(quic_data->retry_scid);
 				process_quic.quic_get_scid_len(quic_data->retry_scid_length);
-				// Update DCID for decryption
-				process_quic.quic_get_dcid_len(quic_data->initial_dcid_length);
+				// Update DCID for decryption: post-Retry Initials are keyed off the Retry's SCID
+				// (RFC 9001 5.2), so both the length and the bytes must come from the SCID.
+				process_quic.quic_get_scid_len(quic_data->initial_dcid_length);
 				process_quic.quic_get_scid(quic_data->initial_dcid);
 
 				process_quic.quic_get_token_length(quic_data->quic_token_length);
