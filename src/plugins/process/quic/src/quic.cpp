@@ -163,8 +163,9 @@ void QUICPlugin::set_cid_fields(
 	case 1:
 		set_stored_cid_fields(quic_data, new_quic_flow);
 
+		// `packets` counts server packets only; a Retry SCID is not the final server SCID
 		if ((!quic_data->scid_set) && (quic_data->packet_from_server_seen)
-			&& (packets - 1 != quic_data->cnt_retry_packets)) {
+			&& (packets > quic_data->cnt_retry_packets)) {
 			process_quic->quic_get_dcid(quic_data->scid);
 			process_quic->quic_get_dcid_len(quic_data->scid_length);
 			quic_data->scid_set = true;
