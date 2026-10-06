@@ -79,6 +79,17 @@ struct CryptoChunk {
 	std::vector<uint8_t> data;
 };
 
+struct CryptoRange {
+	uint64_t offset;
+	uint64_t end;
+};
+
+// Returns the end of the gap-free CRYPTO data beginning at `start`. Sorts `ranges` in place.
+uint64_t crypto_contig_end(CryptoRange* ranges, size_t count, uint64_t start = 0);
+
+// Returns the end offset of the TLS handshake message at `start` (needs its 4-byte header).
+uint64_t tls_handshake_end(const uint8_t* buf, uint64_t start);
+
 class QUICParser {
 private:
 	enum FRAME_TYPE {
@@ -116,6 +127,7 @@ private:
 	bool quic_decrypt_payload();
 	bool quic_reassemble_frames();
 	bool quic_parse_tls();
+	bool quic_crypto_handshake_complete() const;
 	bool quic_obtain_version();
 	bool quic_derive_secrets(uint8_t*);
 	bool quic_check_frame_type(uint8_t*, FRAME_TYPE);
