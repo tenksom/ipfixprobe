@@ -369,38 +369,6 @@ void QUICPlugin::set_packet_type(RecordExtQUIC* quic_data, Flow& rec, uint8_t pa
 	}
 }
 
-static bool is_crypto_buffer_complete(const uint8_t* buf, uint64_t contig_end)
-{
-	if (contig_end < 4) {
-		return false;
-	}
-	// Read the 3-byte big-endian TLS handshake body length from bytes 1-3
-	uint32_t tls_body_len = ((uint32_t) buf[1] << 16) | ((uint32_t) buf[2] << 8) | buf[3];
-	uint64_t total_expected = 4 + tls_body_len;
-	return total_expected <= QUIC_REASSEMBLE_BUFFER_SIZE && contig_end >= total_expected;
-}
-
-// Recomputes how many bytes starting at offset 0 are covered with no gaps, from the set of
-// received ranges. Ranges arrive in packet order, not offset order, so a fresh sort is needed
-// each time - a later packet can close a gap left by an earlier, out-of-order one.
-static uint64_t crypto_contig_end(RecordExtQUIC::CryptoRange* ranges, uint8_t count)
-{
-	std::sort(
-		ranges,
-		ranges + count,
-		[](const RecordExtQUIC::CryptoRange& a, const RecordExtQUIC::CryptoRange& b) {
-			return a.offset < b.offset;
-		});
-	uint64_t contig_end = 0;
-	for (uint8_t i = 0; i < count; i++) {
-		if (ranges[i].offset > contig_end) {
-			break;
-		}
-		contig_end = std::max(contig_end, ranges[i].end);
-	}
-	return contig_end;
-}
-
 int QUICPlugin::process_quic(
 	RecordExtQUIC* quic_data,
 	Flow& rec,
@@ -526,7 +494,9 @@ int QUICPlugin::process_quic(
 				uint64_t contig_end
 					= crypto_contig_end(quic_data->crypto_ranges, quic_data->crypto_range_count);
 
-				if (is_crypto_buffer_complete(quic_data->crypto_buffer, contig_end)) {
+				// contig_end never exceeds the buffer, so oversized messages never complete here
+				if (contig_end >= 4
+					&& contig_end >= tls_handshake_end(quic_data->crypto_buffer, 0)) {
 					if (process_quic.quic_parse_tls_from_assembled(
 							quic_data->crypto_buffer,
 							(uint16_t) contig_end,

@@ -304,6 +304,49 @@ bool QUICParser::quic_parse_tls_extensions()
 	return true;
 }
 
+uint64_t crypto_contig_end(CryptoRange* ranges, size_t count, uint64_t start)
+{
+	// Ranges arrive in packet order, a later packet may close an earlier gap
+	std::sort(ranges, ranges + count, [](const CryptoRange& a, const CryptoRange& b) {
+		return a.offset < b.offset;
+	});
+	uint64_t contig_end = start;
+	for (size_t i = 0; i < count; i++) {
+		if (ranges[i].offset > contig_end) {
+			break;
+		}
+		contig_end = std::max(contig_end, ranges[i].end);
+	}
+	return contig_end;
+}
+
+uint64_t tls_handshake_end(const uint8_t* buf, uint64_t start)
+{
+	// 1 byte type + 3 byte big-endian body length
+	const uint8_t* hs = buf + start;
+	return start + 4 + (((uint64_t) hs[1] << 16) | ((uint64_t) hs[2] << 8) | hs[3]);
+}
+
+// Checks that this packet carries the whole TLS handshake message without gaps. The TLS parser
+// itself accepts truncated messages (e.g. cut inside the SNI).
+bool QUICParser::quic_crypto_handshake_complete() const
+{
+	std::vector<CryptoRange> ranges;
+	for (const auto& chunk : m_crypto_chunks) {
+		ranges.push_back({chunk.offset, chunk.offset + chunk.length});
+	}
+	uint64_t contig_end = crypto_contig_end(ranges.data(), ranges.size(), quic_crypto_start);
+	if (contig_end < quic_crypto_start + 4u) {
+		return false;
+	}
+	uint64_t hs_end = tls_handshake_end(assembled_payload, quic_crypto_start);
+	// Cannot be reassembled anyway, keep best-effort parsing
+	if (hs_end > QUIC_REASSEMBLE_BUFFER_SIZE) {
+		return true;
+	}
+	return contig_end >= hs_end;
+}
+
 bool QUICParser::quic_parse_tls()
 {
 	if (!tls_parser.parse_quic_tls(final_payload + quic_crypto_start, quic_crypto_len)) {
@@ -1506,6 +1549,12 @@ bool QUICParser::quic_parse_initial(
 	}
 	if (!quic_parse_tls()) {
 		DEBUG_MSG("SNI and User Agent Extraction failed\n");
+		return false;
+	}
+	// Checked after the TLS parse on purpose: the parsed handshake type still lets
+	// quic_set_server_port() derive the direction from a partial ClientHello.
+	if (!quic_crypto_handshake_complete()) {
+		DEBUG_MSG("TLS handshake message incomplete in this Initial\n");
 		return false;
 	}
 
