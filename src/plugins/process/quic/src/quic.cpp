@@ -563,6 +563,11 @@ int QUICPlugin::process_quic(
 				process_quic.quic_get_scid(quic_data->initial_dcid);
 
 				process_quic.quic_get_token_length(quic_data->quic_token_length);
+
+				
+				quic_data->crypto_range_count = 0;
+				quic_data->crypto_buffer_complete = false;
+				memset(quic_data->crypto_buffer, 0, sizeof(quic_data->crypto_buffer));
 			}
 
 			if (!quic_data->occid_set) {
