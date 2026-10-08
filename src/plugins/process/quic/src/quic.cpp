@@ -382,7 +382,9 @@ int QUICPlugin::process_quic(
 			pkt,
 			quic_data->initial_dcid,
 			quic_data->initial_dcid_length,
-			quic_data->quic_largest_initial_pn)) {
+			quic_data->quic_largest_initial_pn,
+			quic_data->orig_dcid,
+			quic_data->orig_dcid_length)) {
 		uint32_t version;
 		process_quic.quic_get_version(version);
 
