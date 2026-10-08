@@ -173,6 +173,12 @@ private:
 	uint8_t dcid_len;
 	uint8_t* initial_dcid;
 	uint8_t initial_dcid_len;
+	// DCID of the client's very first Initial. Last-resort key source when initial_dcid points at
+	// a Retry SCID the client never acted upon (Retry lost or corrupted behind the probe).
+	const uint8_t* fallback_dcid;
+	uint8_t fallback_dcid_len;
+	// Set once an Initial's AEAD tag verified, i.e. the right key was found.
+	bool initial_decrypted;
 	const uint8_t* scid;
 	uint8_t scid_len;
 	const uint8_t* pkn;
@@ -304,7 +310,9 @@ public:
 		const Packet& pkt,
 		char* initial_packet_dcid,
 		uint8_t& initial_packet_dcid_length,
-		int64_t& io_largest_initial_pn);
+		int64_t& io_largest_initial_pn,
+		const char* orig_packet_dcid,
+		uint8_t orig_packet_dcid_length);
 	bool quic_parse_headers(const Packet&, bool forceInitialParsing);
 	bool quic_parse_header(
 		const Packet& pkt,
