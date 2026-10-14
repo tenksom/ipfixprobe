@@ -99,6 +99,16 @@ struct RecordExtQUIC : public RecordExt {
 	uint16_t server_port;
 	uint8_t cnt_retry_packets;
 
+	// Every Retry seen in the flow. The server may send several (e.g. the first one is corrupted
+	// behind the probe and the client retransmits its original Initial), but the client acts upon
+	// at most one. A passive probe only learns which one from the DCID of the client's next
+	// Initial, so retry_scid and initial_dcid are switched there (see process_quic()).
+	static constexpr uint8_t MAX_RETRY_CANDIDATES = 4;
+	char retry_candidate_scid[MAX_RETRY_CANDIDATES][MAX_CID_LEN] = {};
+	uint8_t retry_candidate_scid_length[MAX_RETRY_CANDIDATES] = {};
+	uint8_t retry_candidate_count = 0;
+	bool retry_confirmed = false;
+
 	uint8_t quic_multiplexed;
 	uint8_t quic_zero_rtt;
 	uint8_t pkt_types[QUIC_MAX_ELEMCOUNT];

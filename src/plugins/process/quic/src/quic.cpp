@@ -450,6 +450,33 @@ int QUICPlugin::process_quic(
 				quic_data->orig_dcid_set = true;
 			}
 
+			// The first client Initial after a Retry uses that Retry's SCID as DCID (RFC 9000
+			// 17.2.5.2), which tells us which Retry the client accepted. With several Retries in the
+			// flow this need not be the first one. Without switching to the accepted Retry's SCID,
+			// later Initials (whose DCID becomes the server's SCID) cannot be decrypted, e.g. the
+			// remaining CRYPTO fragments of a split ClientHello.
+			if (toServer != 0 && !quic_data->retry_confirmed
+				&& quic_data->retry_candidate_count > 0) {
+				char dcid[MAX_CID_LEN] = {0};
+				uint8_t dcid_len = 0;
+				process_quic.quic_get_dcid(dcid);
+				process_quic.quic_get_dcid_len(dcid_len);
+				for (uint8_t i = 0; i < quic_data->retry_candidate_count; i++) {
+					if (quic_data->retry_candidate_scid_length[i] != dcid_len
+						|| memcmp(quic_data->retry_candidate_scid[i], dcid, dcid_len) != 0) {
+						continue;
+					}
+					quic_data->retry_confirmed = true;
+					// Export the Retry SCID the connection actually continues with, and key the
+					// following Initials off it.
+					memcpy(quic_data->retry_scid, dcid, dcid_len);
+					quic_data->retry_scid_length = dcid_len;
+					memcpy(quic_data->initial_dcid, dcid, dcid_len);
+					quic_data->initial_dcid_length = dcid_len;
+					break;
+				}
+			}
+
 			// Capture the token length from a client->server Initial of the flow. RFC 9000 only
 			// says a client SHOULD repeat the NEW_TOKEN/Retry token in every Initial, so a later
 			// CRYPTO-continuation fragment of a split ClientHello may carry an empty token.
@@ -570,6 +597,15 @@ int QUICPlugin::process_quic(
 				quic_data->crypto_range_count = 0;
 				quic_data->crypto_buffer_complete = false;
 				memset(quic_data->crypto_buffer, 0, sizeof(quic_data->crypto_buffer));
+			}
+
+			// Later Retries are only remembered. Which one the client acted upon is decided by its
+			// next Initial (see PACKET_TYPE::INITIAL above).
+			if (!quic_data->retry_confirmed
+				&& quic_data->retry_candidate_count < RecordExtQUIC::MAX_RETRY_CANDIDATES) {
+				const uint8_t idx = quic_data->retry_candidate_count++;
+				process_quic.quic_get_scid(quic_data->retry_candidate_scid[idx]);
+				process_quic.quic_get_scid_len(quic_data->retry_candidate_scid_length[idx]);
 			}
 
 			if (!quic_data->occid_set) {
