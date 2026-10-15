@@ -17,8 +17,7 @@ on:
 
 jobs:
   quic-flow-compare:
-    runs-on: ubuntu-latest
-    container: oraclelinux:10
+    runs-on: self-hosted
     defaults:
       run:
         shell: bash
