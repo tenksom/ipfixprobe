@@ -1,0 +1,9 @@
+# Input: JSON-kodierte Flows von stdin (z.B. von ipfixprobe via Konverter-Skript)
+- segment: ipfixstdin
+  config:
+    eofcloses: true
+- segment: protomap
+#- segment: printflowdump#
+- segment: parquet
+  config:
+    compression: snappy
