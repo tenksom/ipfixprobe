@@ -17,6 +17,9 @@
 #include <unirec/unirec.h>
 #endif
 
+#include <algorithm>
+#include <cstring>
+
 #include <ipfixprobe/pluginFactory/pluginManifest.hpp>
 #include <ipfixprobe/pluginFactory/pluginRegistrar.hpp>
 
@@ -160,8 +163,9 @@ void QUICPlugin::set_cid_fields(
 	case 1:
 		set_stored_cid_fields(quic_data, new_quic_flow);
 
+		// `packets` counts server packets only; a Retry SCID is not the final server SCID
 		if ((!quic_data->scid_set) && (quic_data->packet_from_server_seen)
-			&& (packets - 1 != quic_data->cnt_retry_packets)) {
+			&& (packets > quic_data->cnt_retry_packets)) {
 			process_quic->quic_get_dcid(quic_data->scid);
 			process_quic->quic_get_dcid_len(quic_data->scid_length);
 			quic_data->scid_set = true;
@@ -267,15 +271,22 @@ void QUICPlugin::set_client_hello_fields(
 	(void) rec;
 	(void) pkt;
 
-	process_quic->quic_get_token_length(quic_data->quic_token_length);
+	// Only adopt the token length from the packet that completed the ClientHello if it was not
+	// already captured from an earlier Initial (see process_quic()). The final CRYPTO fragment of
+	// a split ClientHello may carry an empty token and must not overwrite the real value.
+	if (quic_data->quic_token_length
+		== QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT) {
+		process_quic->quic_get_token_length(quic_data->quic_token_length);
+	}
 	char dcid[MAX_CID_LEN] = {0};
 	uint8_t dcid_len = 0;
 	// since this is a client hello the dcid must be set
 	process_quic->quic_get_dcid(dcid);
 	process_quic->quic_get_dcid_len(dcid_len);
 
-	if ((quic_data->quic_token_length
-		 != QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT)
+	if (quic_data->client_hello_seen
+		&& (quic_data->quic_token_length
+			!= QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT)
 		&& (quic_data->quic_token_length > 0)
 		&& ((quic_data->retry_scid_length == dcid_len)
 			|| ((!new_quic_flow) && (quic_data->retry_scid_length == dcid_len)))
@@ -314,8 +325,20 @@ void QUICPlugin::set_client_hello_fields(
 			process_quic->quic_get_user_agent(quic_data->user_agent);
 
 			if (!quic_data->oscid_set) {
-				process_quic->quic_get_dcid(quic_data->oscid);
-				process_quic->quic_get_dcid_len(quic_data->oscid_length);
+				// OSCID is the DCID of the client's *first* Initial. When the ClientHello is
+				// fragmented across several Initials, the packet that completes reassembly can
+				// already carry the server-chosen DCID (RFC 9000 7.2: the client switches to the
+				// server's SCID once it has processed a server packet, and again after a Retry),
+				// so quic_get_dcid() here would return the wrong value. orig_dcid stashes the
+				// first observed Initial's DCID and - unlike initial_dcid - is never touched
+				// again, including across a Retry.
+				if (quic_data->orig_dcid_set) {
+					memcpy(quic_data->oscid, quic_data->orig_dcid, quic_data->orig_dcid_length);
+					quic_data->oscid_length = quic_data->orig_dcid_length;
+				} else {
+					process_quic->quic_get_dcid(quic_data->oscid);
+					process_quic->quic_get_dcid_len(quic_data->oscid_length);
+				}
 				quic_data->oscid_set = true;
 			}
 
@@ -354,12 +377,14 @@ int QUICPlugin::process_quic(
 	bool new_quic_flow)
 {
 	QUICParser process_quic;
-
 	// Test for QUIC LH packet in UDP payload
 	if (process_quic.quic_check_quic_long_header_packet(
 			pkt,
 			quic_data->initial_dcid,
-			quic_data->initial_dcid_length)) {
+			quic_data->initial_dcid_length,
+			quic_data->quic_largest_initial_pn,
+			quic_data->orig_dcid,
+			quic_data->orig_dcid_length)) {
 		uint32_t version;
 		process_quic.quic_get_version(version);
 
@@ -413,7 +438,106 @@ int QUICPlugin::process_quic(
 			if (quic_data->initial_dcid_length == 0) {
 				process_quic.quic_get_dcid_len(quic_data->initial_dcid_length);
 				process_quic.quic_get_dcid(quic_data->initial_dcid);
-				// Once established it can only be changed by a retry packet.
+			}
+			// Separately remember the DCID of the very first Initial permanently. Unlike
+			// initial_dcid above, a Retry (see PACKET_TYPE::RETRY below) repoints initial_dcid at
+			// the Retry's SCID so AEAD key derivation keeps working for the post-Retry Initial.
+			// OSCID export needs the original value, which orig_dcid_set protects from that
+			// overwrite.
+			if (!quic_data->orig_dcid_set) {
+				process_quic.quic_get_dcid_len(quic_data->orig_dcid_length);
+				process_quic.quic_get_dcid(quic_data->orig_dcid);
+				quic_data->orig_dcid_set = true;
+			}
+
+			// The first client Initial after a Retry uses that Retry's SCID as DCID (RFC 9000
+			// 17.2.5.2), which tells us which Retry the client accepted. With several Retries in
+			// the flow this need not be the first one. Without switching to the accepted Retry's
+			// SCID, later Initials (whose DCID becomes the server's SCID) cannot be decrypted, e.g.
+			// the remaining CRYPTO fragments of a split ClientHello.
+			if (toServer != 0 && !quic_data->retry_confirmed
+				&& quic_data->retry_candidate_count > 0) {
+				char dcid[MAX_CID_LEN] = {0};
+				uint8_t dcid_len = 0;
+				process_quic.quic_get_dcid(dcid);
+				process_quic.quic_get_dcid_len(dcid_len);
+				for (uint8_t i = 0; i < quic_data->retry_candidate_count; i++) {
+					if (quic_data->retry_candidate_scid_length[i] != dcid_len
+						|| memcmp(quic_data->retry_candidate_scid[i], dcid, dcid_len) != 0) {
+						continue;
+					}
+					quic_data->retry_confirmed = true;
+					// Export the Retry SCID the connection actually continues with, and key the
+					// following Initials off it.
+					memcpy(quic_data->retry_scid, dcid, dcid_len);
+					quic_data->retry_scid_length = dcid_len;
+					memcpy(quic_data->initial_dcid, dcid, dcid_len);
+					quic_data->initial_dcid_length = dcid_len;
+					break;
+				}
+			}
+
+			// Capture the token length from a client->server Initial of the flow. RFC 9000 only
+			// says a client SHOULD repeat the NEW_TOKEN/Retry token in every Initial, so a later
+			// CRYPTO-continuation fragment of a split ClientHello may carry an empty token.
+			// Recording it here - rather than only once the ClientHello finishes parsing
+			// (set_client_hello_fields()) - keeps the real value for reassembled ClientHellos and
+			// stops the uninitialized sentinel from being exported for flows whose ClientHello
+			// never reassembles. Retry packets set the token length separately below.
+			//
+			// Adopt the observed value when nothing was captured yet, or when we only saw an
+			// empty token so far and this Initial carries a real one. The latter covers a single
+			// 5-tuple that carries two QUIC connections (e.g. a resumption handshake reusing the
+			// client port): the first connection's ClientHello has no token, the resumption one
+			// presents the NEW_TOKEN token, and that non-zero length is the value worth exporting.
+			// A non-zero capture is never downgraded to 0 by a later (possibly tokenless) Initial.
+			if (toServer != 0 && quic_data->cnt_retry_packets == 0) {
+				uint64_t observed_token_length
+					= QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT;
+				process_quic.quic_get_token_length(observed_token_length);
+				const bool nothing_captured_yet = quic_data->quic_token_length
+					== QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT;
+				if (observed_token_length
+						!= QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT
+					&& (nothing_captured_yet || observed_token_length > 0)) {
+					quic_data->quic_token_length = observed_token_length;
+				}
+			}
+
+			// Multi-packet ClientHello reassembly: accumulate CRYPTO chunks when the single-packet
+			// TLS parse failed (fragmented ClientHello spread across multiple Initial packets).
+			if (!parsed_initial && !quic_data->client_hello_seen
+				&& !quic_data->crypto_buffer_complete && toServer != 0) {
+				std::vector<CryptoChunk> chunks;
+				process_quic.quic_get_crypto_chunks(chunks);
+				for (const auto& chunk : chunks) {
+					if (chunk.offset + chunk.length > QUIC_REASSEMBLE_BUFFER_SIZE) {
+						continue;
+					}
+					memcpy(
+						quic_data->crypto_buffer + chunk.offset,
+						chunk.data.data(),
+						chunk.length);
+					if (quic_data->crypto_range_count < RecordExtQUIC::MAX_CRYPTO_RANGES) {
+						quic_data->crypto_ranges[quic_data->crypto_range_count++]
+							= {chunk.offset, chunk.offset + chunk.length};
+					}
+				}
+
+				uint64_t contig_end
+					= crypto_contig_end(quic_data->crypto_ranges, quic_data->crypto_range_count);
+
+				// contig_end never exceeds the buffer, so oversized messages never complete here
+				if (contig_end >= 4
+					&& contig_end >= tls_handshake_end(quic_data->crypto_buffer, 0)) {
+					if (process_quic.quic_parse_tls_from_assembled(
+							quic_data->crypto_buffer,
+							(uint16_t) contig_end,
+							pkt)) {
+						parsed_initial = 1;
+						quic_data->crypto_buffer_complete = true;
+					}
+				}
 			}
 
 			if (parsed_initial && (process_quic.quic_get_tls_hs_type() == 1)) {
@@ -465,11 +589,25 @@ int QUICPlugin::process_quic(
 				// Additionally set token len
 				process_quic.quic_get_scid(quic_data->retry_scid);
 				process_quic.quic_get_scid_len(quic_data->retry_scid_length);
-				// Update DCID for decryption
-				process_quic.quic_get_dcid_len(quic_data->initial_dcid_length);
+				// Update DCID for decryption: post-Retry Initials are keyed off the Retry's SCID
+				// (RFC 9001 5.2), so both the length and the bytes must come from the SCID.
+				process_quic.quic_get_scid_len(quic_data->initial_dcid_length);
 				process_quic.quic_get_scid(quic_data->initial_dcid);
 
 				process_quic.quic_get_token_length(quic_data->quic_token_length);
+
+				quic_data->crypto_range_count = 0;
+				quic_data->crypto_buffer_complete = false;
+				memset(quic_data->crypto_buffer, 0, sizeof(quic_data->crypto_buffer));
+			}
+
+			// Later Retries are only remembered. Which one the client acted upon is decided by its
+			// next Initial (see PACKET_TYPE::INITIAL above).
+			if (!quic_data->retry_confirmed
+				&& quic_data->retry_candidate_count < RecordExtQUIC::MAX_RETRY_CANDIDATES) {
+				const uint8_t idx = quic_data->retry_candidate_count++;
+				process_quic.quic_get_scid(quic_data->retry_candidate_scid[idx]);
+				process_quic.quic_get_scid_len(quic_data->retry_candidate_scid_length[idx]);
 			}
 
 			if (!quic_data->occid_set) {

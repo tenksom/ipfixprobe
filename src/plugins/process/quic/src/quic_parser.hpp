@@ -11,6 +11,8 @@
  * \date 2023
  */
 
+#include <vector>
+
 #include <ipfixprobe/byte-utils.hpp>
 #include <ipfixprobe/processPlugin.hpp>
 #include <openssl/evp.h>
@@ -43,6 +45,7 @@
 #define MAX_HEADER_LEN 67 + 256
 #define BUFF_SIZE 255
 #define CURRENT_BUFFER_SIZE 1500
+#define QUIC_REASSEMBLE_BUFFER_SIZE 2000
 // 8 because (1B QUIC LH, 4B Version, 1 B SCID LEN, 1B DCID LEN, Payload/Retry Token/Supported
 // Version >= 1 B)
 #define QUIC_MIN_PACKET_LENGTH 8
@@ -67,6 +70,26 @@ typedef struct Initial_Secrets {
 	uint8_t iv[TLS13_AEAD_NONCE_LENGTH];
 	uint8_t hp[AES_128_KEY_LENGTH];
 } Initial_Secrets;
+
+struct CryptoChunk {
+	uint64_t offset;
+	uint16_t length;
+	// Owns a copy of the bytes: a same-packet retry (e.g. the session-resumption DCID fallback
+	// in quic_parse_headers()) re-decrypts into the shared decrypted_payload buffer and would
+	// otherwise silently corrupt a chunk captured by an earlier, successful attempt.
+	std::vector<uint8_t> data;
+};
+
+struct CryptoRange {
+	uint64_t offset;
+	uint64_t end;
+};
+
+// Returns the end of the gap-free CRYPTO data beginning at `start`. Sorts `ranges` in place.
+uint64_t crypto_contig_end(CryptoRange* ranges, size_t count, uint64_t start = 0);
+
+// Returns the end offset of the TLS handshake message at `start` (needs its 4-byte header).
+uint64_t tls_handshake_end(const uint8_t* buf, uint64_t start);
 
 class QUICParser {
 private:
@@ -105,6 +128,7 @@ private:
 	bool quic_decrypt_payload();
 	bool quic_reassemble_frames();
 	bool quic_parse_tls();
+	bool quic_crypto_handshake_complete() const;
 	bool quic_obtain_version();
 	bool quic_derive_secrets(uint8_t*);
 	bool quic_check_frame_type(uint8_t*, FRAME_TYPE);
@@ -150,6 +174,12 @@ private:
 	uint8_t dcid_len;
 	uint8_t* initial_dcid;
 	uint8_t initial_dcid_len;
+	// DCID of the client's very first Initial. Last-resort key source when initial_dcid points at
+	// a Retry SCID the client never acted upon (Retry lost or corrupted behind the probe).
+	const uint8_t* fallback_dcid;
+	uint8_t fallback_dcid_len;
+	// Set once an Initial's AEAD tag verified, i.e. the right key was found.
+	bool initial_decrypted;
 	const uint8_t* scid;
 	uint8_t scid_len;
 	const uint8_t* pkn;
@@ -159,8 +189,14 @@ private:
 
 	uint8_t pkn_len;
 
-	uint8_t decrypted_payload[CURRENT_BUFFER_SIZE];
-	uint8_t assembled_payload[CURRENT_BUFFER_SIZE];
+	// RFC 9000, Appendix A.3 full packet number reconstruction for the AEAD nonce.
+	// largest_initial_pn: largest client Initial packet number decrypted so far in the flow (-1 =
+	// none). current_initial_pn: full packet number of the Initial currently being decrypted.
+	int64_t largest_initial_pn;
+	int64_t current_initial_pn;
+
+	uint8_t decrypted_payload[QUIC_REASSEMBLE_BUFFER_SIZE];
+	uint8_t assembled_payload[QUIC_REASSEMBLE_BUFFER_SIZE];
 	uint8_t tmp_header_mem[MAX_HEADER_LEN];
 	uint8_t* final_payload;
 	uint8_t zero_rtt;
@@ -188,6 +224,7 @@ private:
 	uint16_t quic_crypto_start;
 	uint16_t quic_crypto_len;
 	TLSParser tls_parser;
+	std::vector<CryptoChunk> m_crypto_chunks;
 
 	uint8_t packets;
 
@@ -273,7 +310,10 @@ public:
 	bool quic_check_quic_long_header_packet(
 		const Packet& pkt,
 		char* initial_packet_dcid,
-		uint8_t& initial_packet_dcid_length);
+		uint8_t& initial_packet_dcid_length,
+		int64_t& io_largest_initial_pn,
+		const char* orig_packet_dcid,
+		uint8_t orig_packet_dcid_length);
 	bool quic_parse_headers(const Packet&, bool forceInitialParsing);
 	bool quic_parse_header(
 		const Packet& pkt,
@@ -291,6 +331,8 @@ public:
 	void quic_get_tls_extension_lengths(uint16_t* tls_extensions_len);
 	void quic_get_tls_extension_lengths_len(uint8_t& tls_extensions_length_len_toset);
 	void quic_get_tls_extensions(char* in);
+	void quic_get_crypto_chunks(std::vector<CryptoChunk>& out);
+	bool quic_parse_tls_from_assembled(const uint8_t* buf, uint16_t len, const Packet& pkt);
 };
 
 } // namespace ipxp
