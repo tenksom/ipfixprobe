@@ -19,7 +19,7 @@ jobs:
 
   editor-config:
     runs-on: ubuntu-latest
-    container: mstruebing/editorconfig-checker
+    container: mstruebing/editorconfig-checker:v3.11.3
     steps:
     - name: Check out repository code
       uses: actions/checkout@v4
