@@ -473,6 +473,12 @@ int QUICPlugin::process_quic(
 					quic_data->retry_scid_length = dcid_len;
 					memcpy(quic_data->initial_dcid, dcid, dcid_len);
 					quic_data->initial_dcid_length = dcid_len;
+					// Mark this Initial in QUIC_PACKETS as the one that adopted the Retry. Its
+					// entry was already written by set_packet_type() above.
+					const uint32_t pos = rec.src_packets + rec.dst_packets - 1;
+					if (pos < QUIC_MAX_ELEMCOUNT) {
+						quic_data->pkt_types[pos] |= QUICParser::F_RETRY_TOKEN_USED;
+					}
 					break;
 				}
 			}

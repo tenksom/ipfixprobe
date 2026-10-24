@@ -242,6 +242,9 @@ public:
 		F_HANDSHAKE = 0b00000100,
 		F_RETRY = 0b00001000,
 		F_VERSION_NEGOTIATION = 0b00010000,
+		// Not a packet type: set by the plugin on the client Initial that continues with the
+		// SCID of a previously seen Retry, i.e. the client adopted that Retry (and its token).
+		F_RETRY_TOKEN_USED = 0b01000000,
 		// We store the QUIC bit in the first bit of QUIC_PACKETS
 		// The following enum should not be used, unless for extraction
 		F_QUIC_BIT = 0b10000000
