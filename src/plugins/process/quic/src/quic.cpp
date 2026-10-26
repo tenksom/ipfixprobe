@@ -467,10 +467,11 @@ int QUICPlugin::process_quic(
 						continue;
 					}
 					quic_data->retry_confirmed = true;
-					// Export the Retry SCID the connection actually continues with, and key the
-					// following Initials off it.
+					// Export the Retry SCID and token length the connection actually continues
+					// with, and key the following Initials off it.
 					memcpy(quic_data->retry_scid, dcid, dcid_len);
 					quic_data->retry_scid_length = dcid_len;
+					quic_data->quic_token_length = quic_data->retry_candidate_token_length[i];
 					memcpy(quic_data->initial_dcid, dcid, dcid_len);
 					quic_data->initial_dcid_length = dcid_len;
 					// Mark this Initial in QUIC_PACKETS as the one that adopted the Retry. Its
@@ -587,31 +588,37 @@ int QUICPlugin::process_quic(
 			 * A client MUST accept and process at most one Retry packet for each connection
 			 * attempt. After the client has received and processed an Initial or Retry packet from
 			 * the server, it MUST discard any subsequent Retry packets that it receives.
+			 *
+			 * A passive probe cannot tell which Retry that is until the client's next Initial
+			 * (see PACKET_TYPE::INITIAL above). Until then export the most recent Retry, e.g. the
+			 * one a flow ends with. Whether it was adopted is visible via F_RETRY_TOKEN_USED in
+			 * QUIC_PACKETS.
 			 */
-			if (quic_data->cnt_retry_packets == 1) {
-				// Additionally set token len
+			if (!quic_data->retry_confirmed) {
 				process_quic.quic_get_scid(quic_data->retry_scid);
 				process_quic.quic_get_scid_len(quic_data->retry_scid_length);
+				process_quic.quic_get_token_length(quic_data->quic_token_length);
+			}
+
+			if (quic_data->cnt_retry_packets == 1) {
 				// Update DCID for decryption: post-Retry Initials are keyed off the Retry's SCID
 				// (RFC 9001 5.2), so both the length and the bytes must come from the SCID.
 				process_quic.quic_get_scid_len(quic_data->initial_dcid_length);
 				process_quic.quic_get_scid(quic_data->initial_dcid);
 
-				process_quic.quic_get_token_length(quic_data->quic_token_length);
-
-				
 				quic_data->crypto_range_count = 0;
 				quic_data->crypto_buffer_complete = false;
 				memset(quic_data->crypto_buffer, 0, sizeof(quic_data->crypto_buffer));
 			}
 
-			// Later Retries are only remembered. Which one the client acted upon is decided by its
-			// next Initial (see PACKET_TYPE::INITIAL above).
+			// Remember every Retry. Which one the client acted upon is decided by its next Initial
+			// (see PACKET_TYPE::INITIAL above).
 			if (!quic_data->retry_confirmed
 				&& quic_data->retry_candidate_count < RecordExtQUIC::MAX_RETRY_CANDIDATES) {
 				const uint8_t idx = quic_data->retry_candidate_count++;
 				process_quic.quic_get_scid(quic_data->retry_candidate_scid[idx]);
 				process_quic.quic_get_scid_len(quic_data->retry_candidate_scid_length[idx]);
+				process_quic.quic_get_token_length(quic_data->retry_candidate_token_length[idx]);
 			}
 
 			if (!quic_data->occid_set) {
