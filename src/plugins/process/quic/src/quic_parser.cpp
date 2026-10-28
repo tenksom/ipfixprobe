@@ -1060,7 +1060,8 @@ inline void QUICParser::quic_copy_crypto(uint8_t* start, const uint8_t* end, uin
 	}
 
 	frame_offset = std::min(frame_offset, (uint32_t) (QUIC_REASSEMBLE_BUFFER_SIZE - 1));
-	frame_length = std::min((uint32_t) (QUIC_REASSEMBLE_BUFFER_SIZE - 1 - frame_offset), frame_length);
+	frame_length
+		= std::min((uint32_t) (QUIC_REASSEMBLE_BUFFER_SIZE - 1 - frame_offset), frame_length);
 	// avoid memory overlap in memcpy when not enought space in source buffer
 	frame_length = std::min(frame_length, (uint32_t) (end - (start + offset)));
 
@@ -1360,8 +1361,8 @@ bool QUICParser::quic_parse_header(
 }
 
 // Loops over the QUIC packets coalesced in one UDP datagram, parses each long header and (for the
-// first Initial) the ClientHello. Stops at the first packet it can't handle. Returns the packet-type
-// flags, 0 on failure.
+// first Initial) the ClientHello. Stops at the first packet it can't handle. Returns the
+// packet-type flags, 0 on failure.
 bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 {
 	(void) pkt;
@@ -1430,8 +1431,9 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 				// Retry reached the client. If it was lost or corrupted behind the probe, the
 				// client keeps its original keys, also once it switched to the server's SCID.
 				if (!parsed_initial && !initial_decrypted && fallback_dcid_len != 0
-					&& !(dcid_len == fallback_dcid_len
-						 && memcmp(dcid, fallback_dcid, fallback_dcid_len) == 0)) {
+					&& !(
+						dcid_len == fallback_dcid_len
+						&& memcmp(dcid, fallback_dcid, fallback_dcid_len) == 0)) {
 					quic_tls_extension_lengths_pos = 0;
 					initial_dcid_len = fallback_dcid_len;
 					initial_dcid = (uint8_t*) fallback_dcid;

@@ -451,10 +451,10 @@ int QUICPlugin::process_quic(
 			}
 
 			// The first client Initial after a Retry uses that Retry's SCID as DCID (RFC 9000
-			// 17.2.5.2), which tells us which Retry the client accepted. With several Retries in the
-			// flow this need not be the first one. Without switching to the accepted Retry's SCID,
-			// later Initials (whose DCID becomes the server's SCID) cannot be decrypted, e.g. the
-			// remaining CRYPTO fragments of a split ClientHello.
+			// 17.2.5.2), which tells us which Retry the client accepted. With several Retries in
+			// the flow this need not be the first one. Without switching to the accepted Retry's
+			// SCID, later Initials (whose DCID becomes the server's SCID) cannot be decrypted, e.g.
+			// the remaining CRYPTO fragments of a split ClientHello.
 			if (toServer != 0 && !quic_data->retry_confirmed
 				&& quic_data->retry_candidate_count > 0) {
 				char dcid[MAX_CID_LEN] = {0};
@@ -521,7 +521,10 @@ int QUICPlugin::process_quic(
 					if (chunk.offset + chunk.length > QUIC_REASSEMBLE_BUFFER_SIZE) {
 						continue;
 					}
-					memcpy(quic_data->crypto_buffer + chunk.offset, chunk.data.data(), chunk.length);
+					memcpy(
+						quic_data->crypto_buffer + chunk.offset,
+						chunk.data.data(),
+						chunk.length);
 					if (quic_data->crypto_range_count < RecordExtQUIC::MAX_CRYPTO_RANGES) {
 						quic_data->crypto_ranges[quic_data->crypto_range_count++]
 							= {chunk.offset, chunk.offset + chunk.length};
