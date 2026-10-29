@@ -59,6 +59,8 @@ QUICParser::QUICParser()
 	pkn_len = 0;
 	tls_hs_type = 0;
 	parsed_client_hello = false;
+	largest_initial_pn = -1;
+	current_initial_pn = -1;
 
 	memset(quic_tls_ext_type, 0, sizeof(quic_tls_ext_type));
 	quic_tls_ext_type_pos = 0;
@@ -302,6 +304,49 @@ bool QUICParser::quic_parse_tls_extensions()
 	return true;
 }
 
+uint64_t crypto_contig_end(CryptoRange* ranges, size_t count, uint64_t start)
+{
+	// Ranges arrive in packet order, a later packet may close an earlier gap
+	std::sort(ranges, ranges + count, [](const CryptoRange& a, const CryptoRange& b) {
+		return a.offset < b.offset;
+	});
+	uint64_t contig_end = start;
+	for (size_t i = 0; i < count; i++) {
+		if (ranges[i].offset > contig_end) {
+			break;
+		}
+		contig_end = std::max(contig_end, ranges[i].end);
+	}
+	return contig_end;
+}
+
+uint64_t tls_handshake_end(const uint8_t* buf, uint64_t start)
+{
+	// 1 byte type + 3 byte big-endian body length
+	const uint8_t* hs = buf + start;
+	return start + 4 + (((uint64_t) hs[1] << 16) | ((uint64_t) hs[2] << 8) | hs[3]);
+}
+
+// Checks that this packet carries the whole TLS handshake message without gaps. The TLS parser
+// itself accepts truncated messages (e.g. cut inside the SNI).
+bool QUICParser::quic_crypto_handshake_complete() const
+{
+	std::vector<CryptoRange> ranges;
+	for (const auto& chunk : m_crypto_chunks) {
+		ranges.push_back({chunk.offset, chunk.offset + chunk.length});
+	}
+	uint64_t contig_end = crypto_contig_end(ranges.data(), ranges.size(), quic_crypto_start);
+	if (contig_end < quic_crypto_start + 4u) {
+		return false;
+	}
+	uint64_t hs_end = tls_handshake_end(assembled_payload, quic_crypto_start);
+	// Cannot be reassembled anyway, keep best-effort parsing
+	if (hs_end > QUIC_REASSEMBLE_BUFFER_SIZE) {
+		return true;
+	}
+	return contig_end >= hs_end;
+}
+
 bool QUICParser::quic_parse_tls()
 {
 	if (!tls_parser.parse_quic_tls(final_payload + quic_crypto_start, quic_crypto_len)) {
@@ -401,6 +446,7 @@ bool QUICParser::quic_check_version(uint32_t version, uint8_t max_version)
 
 bool QUICParser::quic_obtain_version()
 {
+	const uint32_t previous_version = version;
 	version = quic_h1->version;
 	version = ntohl(version);
 	// this salt is used to draft 7-9
@@ -469,6 +515,9 @@ bool QUICParser::quic_obtain_version()
 		salt = handshake_salt_v2;
 	} else {
 		DEBUG_MSG("Error, version not supported\n");
+		// Keep the version parsed from an earlier (valid) packet instead of exporting the bytes
+		// of an unparsable coalesced segment.
+		version = previous_version;
 		return false;
 	}
 
@@ -831,15 +880,35 @@ bool QUICParser::quic_decrypt_initial_header(const uint8_t* payload_pointer, uin
 	for (unsigned int i = 0; i < pkn_len; i++) {
 		packet_number |= (full_pkn[i] ^ mask[1 + i]) << (8 * (pkn_len - 1 - i));
 	}
+	// The header (AEAD associated data) keeps the truncated on-wire packet number.
 	for (unsigned i = 0; i < pkn_len; i++) {
 		header[header_len - 1 - i] = (uint8_t) (packet_number >> (8 * i));
 	}
+
+	// Reconstruct the full packet number for the AEAD nonce (RFC 9000, Appendix A.3). Without
+	// this, a follow-up Initial carrying the tail of a fragmented ClientHello fails to decrypt
+	// once its truncated packet number has wrapped relative to the first Initial (e.g. a client
+	// that starts its Initial packet number well above zero).
+	uint64_t full_packet_number = packet_number;
+	if (largest_initial_pn >= 0 && pkn_len < 8) {
+		const uint64_t pn_win = (uint64_t) 1 << (pkn_len * 8);
+		const uint64_t pn_hwin = pn_win / 2;
+		const uint64_t expected_pn = (uint64_t) largest_initial_pn + 1;
+		full_packet_number = (expected_pn & ~(pn_win - 1)) | packet_number;
+		if (full_packet_number + pn_hwin <= expected_pn) {
+			full_packet_number += pn_win;
+		} else if (full_packet_number > expected_pn + pn_hwin && full_packet_number >= pn_win) {
+			full_packet_number -= pn_win;
+		}
+	}
+	current_initial_pn = (int64_t) full_packet_number;
+
 	// adjust nonce for payload decryption
 	// https://www.rfc-editor.org/rfc/rfc9001.html#name-aead-usage
 	//  The exclusive OR of the padded packet number and the IV forms the AEAD nonce
 	phton64(
 		initial_secrets.iv + sizeof(initial_secrets.iv) - 8,
-		pntoh64(initial_secrets.iv + sizeof(initial_secrets.iv) - 8) ^ packet_number);
+		pntoh64(initial_secrets.iv + sizeof(initial_secrets.iv) - 8) ^ full_packet_number);
 	return true;
 } // QUICPlugin::quic_decrypt_initial_header
 
@@ -987,11 +1056,14 @@ inline void QUICParser::quic_copy_crypto(uint8_t* start, const uint8_t* end, uin
 		return;
 	}
 
-	frame_offset = std::min(frame_offset, (uint32_t) (CURRENT_BUFFER_SIZE - 1));
-	frame_length = std::min((uint32_t) (CURRENT_BUFFER_SIZE - 1 - frame_offset), frame_length);
+	frame_offset = std::min(frame_offset, (uint32_t) (QUIC_REASSEMBLE_BUFFER_SIZE - 1));
+	frame_length
+		= std::min((uint32_t) (QUIC_REASSEMBLE_BUFFER_SIZE - 1 - frame_offset), frame_length);
 	// avoid memory overlap in memcpy when not enought space in source buffer
 	frame_length = std::min(frame_length, (uint32_t) (end - (start + offset)));
 
+	std::vector<uint8_t> chunk_data(start + offset, start + offset + frame_length);
+	m_crypto_chunks.push_back({frame_offset, (uint16_t) frame_length, std::move(chunk_data)});
 	memcpy(assembled_payload + frame_offset, start + offset, frame_length);
 	if (frame_offset < quic_crypto_start) {
 		quic_crypto_start = frame_offset;
@@ -1005,6 +1077,7 @@ bool QUICParser::quic_reassemble_frames()
 {
 	quic_crypto_start = UINT16_MAX;
 	quic_crypto_len = 0;
+	m_crypto_chunks.clear();
 
 	uint64_t offset = 0;
 	uint8_t* payload_end = decrypted_payload + payload_len;
@@ -1301,6 +1374,13 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 	while (pkt.payload + offset + QUIC_MIN_PACKET_LENGTH <= pkt.payload + pkt.payload_len) {
 		payload_pointer = pkt_payload_pointer + offset;
 
+		// Bytes after the last coalesced packet are datagram padding, not another packet. picoquic
+		// pads datagrams below 1200 bytes this way (random bytes, zeros since picoquic commit
+		// 62c443d). Parsing them as a header would overwrite the real version.
+		if (!quic_check_supported_version(ntohl(read_uint32_t(payload_pointer, 1)))) {
+			break;
+		}
+
 		if (!quic_parse_header(pkt, offset, pkt_payload_pointer, pkt_payload_end)) {
 			break;
 		}
@@ -1345,8 +1425,11 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 			offset += stored_payload_len;
 			break;
 		case RETRY:
-			// 16 - Integrity tag
-			token_length = pkt_payload_end - payload_pointer - offset - 16;
+			// Retry token = bytes between the header and the trailing 16-byte Retry Integrity Tag.
+			// offset is absolute from the datagram start; payload_pointer already embeds this
+			// iteration's start offset, so subtracting offset on top of it double-counts the start
+			// offset for a coalesced (non-first) Retry. Anchor on pkt_payload_pointer instead.
+			token_length = pkt_payload_end - (pkt_payload_pointer + offset) - 16;
 			if (!quic_check_pointer_pos((pkt_payload_pointer + offset), pkt_payload_end)) {
 				return false;
 			}
@@ -1359,7 +1442,12 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 
 		if (!quic_set_server_port(pkt)) {
 			DEBUG_MSG("Error, extracting server port");
-			return false;
+			// For Initial packets without a parsed TLS handshake (e.g., the second UDP datagram of
+			// a fragmented ClientHello), the server port cannot be determined yet. Do not abort;
+			// it will be set once the assembled CRYPTO buffer is fully parsed.
+			if (packet_type != INITIAL || parsed_initial) {
+				return false;
+			}
 		}
 
 		if (packet_type == RETRY) {
@@ -1377,12 +1465,14 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 
 bool QUICParser::quic_set_server_port(const Packet& pkt)
 {
-	if (!tls_parser.get_handshake().has_value()) {
-		return false;
-	}
-
 	switch (packet_type) {
 	case INITIAL:
+		// Only Initials carry CRYPTO frames, so only they need a parsed handshake to derive the
+		// direction. Checking this before the switch would also reject Retries etc. that arrive
+		// while the ClientHello is still incomplete.
+		if (!tls_parser.get_handshake().has_value()) {
+			return false;
+		}
 		tls_hs_type = tls_parser.get_handshake()->type;
 		if (tls_hs_type == 1) {
 			server_port = pkt.dst_port;
@@ -1408,23 +1498,24 @@ bool QUICParser::quic_set_server_port(const Packet& pkt)
 
 bool QUICParser::quic_check_quic_long_header_packet(
 	const Packet& pkt,
-	char* initial_packet_dcid,
-	uint8_t& initial_packet_dcid_length)
+	const char* initial_packet_dcid,
+	uint8_t initial_packet_dcid_length,
+	int64_t& io_largest_initial_pn)
 {
 	initial_dcid_len = initial_packet_dcid_length;
 	initial_dcid = (uint8_t*) initial_packet_dcid;
+	largest_initial_pn = io_largest_initial_pn;
 
 	quic_parse_quic_bit(pkt.payload[0]);
 
-	if (!quic_long_header_packet(pkt)) {
-		return false;
+	bool ok = quic_long_header_packet(pkt);
+	if (ok) {
+		quic_initialze_arrays();
+		ok = quic_parse_headers(pkt, false);
 	}
 
-	quic_initialze_arrays();
-	if (!quic_parse_headers(pkt, false)) {
-		return false;
-	}
-	return true;
+	io_largest_initial_pn = largest_initial_pn;
+	return ok;
 }
 
 bool QUICParser::quic_parse_initial(
@@ -1444,12 +1535,20 @@ bool QUICParser::quic_parse_initial(
 		DEBUG_MSG("Error, payload decryption failed (client side)\n");
 		return false;
 	}
+
+	if (current_initial_pn > largest_initial_pn) {
+		largest_initial_pn = current_initial_pn;
+	}
 	if (!quic_reassemble_frames()) {
 		DEBUG_MSG("Error, reassembling of crypto frames failed (client side)\n");
 		return false;
 	}
 	if (!quic_parse_tls()) {
 		DEBUG_MSG("SNI and User Agent Extraction failed\n");
+		return false;
+	}
+	if (!quic_crypto_handshake_complete()) {
+		DEBUG_MSG("TLS handshake message incomplete in this Initial\n");
 		return false;
 	}
 
@@ -1466,6 +1565,29 @@ bool QUICParser::quic_parse_initial(
 		parsed_client_hello = true;
 	}
 
+	return true;
+}
+
+void QUICParser::quic_get_crypto_chunks(std::vector<CryptoChunk>& out)
+{
+	out = m_crypto_chunks;
+}
+
+bool QUICParser::quic_parse_tls_from_assembled(const uint8_t* buf, uint16_t len, const Packet& pkt)
+{
+	if (!tls_parser.parse_quic_tls(buf, len)) {
+		return false;
+	}
+	if (!quic_parse_tls_extensions()) {
+		return false;
+	}
+	parsed_initial = 1;
+	if (!quic_set_server_port(pkt)) {
+		return false;
+	}
+	if (tls_hs_type == TLS_HANDSHAKE_CLIENT_HELLO) {
+		parsed_client_hello = true;
+	}
 	return true;
 }
 
