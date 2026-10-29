@@ -73,7 +73,6 @@ struct RecordExtQUIC : public RecordExt {
 	uint8_t occid_length;
 	uint8_t oscid_length;
 	uint8_t scid_length;
-	uint8_t initial_dcid_length;
 	uint8_t orig_dcid_length;
 	uint8_t dir_scid_length;
 	uint8_t dir_dcid_length;
@@ -83,10 +82,8 @@ struct RecordExtQUIC : public RecordExt {
 	char occid[MAX_CID_LEN] = {0};
 	char oscid[MAX_CID_LEN] = {0};
 	char scid[MAX_CID_LEN] = {0};
-	char initial_dcid[MAX_CID_LEN] = {0};
-	// DCID of the very first Initial the client ever sent, unlike initial_dcid, this is never
-	// overwritten by a Retry (initial_dcid is repointed to the Retry's SCID for AEAD key
-	// derivation once a Retry is seen). Kept solely to export the correct OSCID.
+	// DCID of the very first Initial the client ever sent, never overwritten by a Retry. Exported
+	// as OSCID and used for Initial key derivation until a Retry is confirmed.
 	char orig_dcid[MAX_CID_LEN] = {0};
 	char retry_scid[MAX_CID_LEN] = {0};
 	// Intermediate storage when direction is not clear
@@ -99,11 +96,8 @@ struct RecordExtQUIC : public RecordExt {
 	uint16_t server_port;
 	uint8_t cnt_retry_packets;
 
-	// Every Retry seen in the flow. The server may send several (e.g. the first one is corrupted
-	// behind the probe and the client retransmits its original Initial), but the client acts upon
-	// at most one. A passive probe only learns which one from the DCID of the client's next
-	// Initial, so retry_scid, quic_token_length and initial_dcid are switched there (see
-	// process_quic()). Until then the most recent Retry is exported.
+	// Every Retry sent by the server. A server may send several, but the client accepts at most
+	// one; its next Initial confirms which one. The confirmed one is exported and keys decryption.
 	static constexpr uint8_t MAX_RETRY_CANDIDATES = 4;
 	char retry_candidate_scid[MAX_RETRY_CANDIDATES][MAX_CID_LEN] = {};
 	uint8_t retry_candidate_scid_length[MAX_RETRY_CANDIDATES] = {};
@@ -199,8 +193,6 @@ struct RecordExtQUIC : public RecordExt {
 		tls_ext_set = false;
 
 		last_pkt_type = 0;
-		initial_dcid[0] = 0;
-		initial_dcid_length = 0;
 		orig_dcid[0] = 0;
 		orig_dcid_length = 0;
 		parsed_ch = 0;

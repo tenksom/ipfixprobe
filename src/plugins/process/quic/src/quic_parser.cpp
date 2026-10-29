@@ -43,9 +43,6 @@ QUICParser::QUICParser()
 	dcid_len = 0;
 	initial_dcid = nullptr;
 	initial_dcid_len = 0;
-	fallback_dcid = nullptr;
-	fallback_dcid_len = 0;
-	initial_decrypted = false;
 	scid = nullptr;
 	scid_len = 0;
 	pkn = nullptr;
@@ -1360,9 +1357,6 @@ bool QUICParser::quic_parse_header(
 	return true;
 }
 
-// Loops over the QUIC packets coalesced in one UDP datagram, parses each long header and (for the
-// first Initial) the ClientHello. Stops at the first packet it can't handle. Returns the
-// packet-type flags, 0 on failure.
 bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 {
 	(void) pkt;
@@ -1380,8 +1374,9 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 	while (pkt.payload + offset + QUIC_MIN_PACKET_LENGTH <= pkt.payload + pkt.payload_len) {
 		payload_pointer = pkt_payload_pointer + offset;
 
-		// An unknown version here means it's not another packet but datagram padding (picoquic
-		// pads with random bytes). Parsing it as a header would clobber the real version.
+		// Bytes after the last coalesced packet are datagram padding, not another packet. picoquic
+		// pads datagrams below 1200 bytes this way (random bytes, zeros since picoquic commit
+		// 62c443d). Parsing them as a header would overwrite the real version.
 		if (!quic_check_supported_version(ntohl(read_uint32_t(payload_pointer, 1)))) {
 			break;
 		}
@@ -1422,22 +1417,6 @@ bool QUICParser::quic_parse_headers(const Packet& pkt, bool forceInitialParsing)
 					// Increment by tag_len, since subsequent function is not stateless.
 					payload_len += payload_len_offset;
 					// Undo side effect from QUICParser::quic_decrypt_initial_header
-					payload = payload - pkn_len;
-					payload_len += pkn_len;
-					quic_parse_initial(pkt, pkt_payload_pointer, offset);
-				}
-				// Last resort: keys from the client's very first Initial DCID. After a Retry the
-				// inherited DCID is the Retry SCID, but a passive probe cannot know whether that
-				// Retry reached the client. If it was lost or corrupted behind the probe, the
-				// client keeps its original keys, also once it switched to the server's SCID.
-				if (!parsed_initial && !initial_decrypted && fallback_dcid_len != 0
-					&& !(
-						dcid_len == fallback_dcid_len
-						&& memcmp(dcid, fallback_dcid, fallback_dcid_len) == 0)) {
-					quic_tls_extension_lengths_pos = 0;
-					initial_dcid_len = fallback_dcid_len;
-					initial_dcid = (uint8_t*) fallback_dcid;
-					payload_len += payload_len_offset;
 					payload = payload - pkn_len;
 					payload_len += pkn_len;
 					quic_parse_initial(pkt, pkt_payload_pointer, offset);
@@ -1488,10 +1467,9 @@ bool QUICParser::quic_set_server_port(const Packet& pkt)
 {
 	switch (packet_type) {
 	case INITIAL:
-		// Only the Initial packet's direction depends on the TLS handshake type (CH vs SH). A
-		// ClientHello fragmented across multiple Initial packets leaves the TLS parser without a
-		// handshake here for the non-final fragments; the caller tolerates that (see
-		// quic_parse_headers()). Packets of other types must not be penalized for it below.
+		// Only Initials carry CRYPTO frames, so only they need a parsed handshake to derive the
+		// direction. Checking this before the switch would also reject Retries etc. that arrive
+		// while the ClientHello is still incomplete.
 		if (!tls_parser.get_handshake().has_value()) {
 			return false;
 		}
@@ -1520,20 +1498,12 @@ bool QUICParser::quic_set_server_port(const Packet& pkt)
 
 bool QUICParser::quic_check_quic_long_header_packet(
 	const Packet& pkt,
-	char* initial_packet_dcid,
-	uint8_t& initial_packet_dcid_length,
-	int64_t& io_largest_initial_pn,
-	const char* orig_packet_dcid,
-	uint8_t orig_packet_dcid_length)
+	const char* initial_packet_dcid,
+	uint8_t initial_packet_dcid_length,
+	int64_t& io_largest_initial_pn)
 {
 	initial_dcid_len = initial_packet_dcid_length;
 	initial_dcid = (uint8_t*) initial_packet_dcid;
-	// Only needed when the inherited DCID differs from the original one, i.e. after a Retry.
-	if (orig_packet_dcid_length != initial_packet_dcid_length
-		|| memcmp(orig_packet_dcid, initial_packet_dcid, orig_packet_dcid_length) != 0) {
-		fallback_dcid_len = orig_packet_dcid_length;
-		fallback_dcid = (const uint8_t*) orig_packet_dcid;
-	}
 	largest_initial_pn = io_largest_initial_pn;
 
 	quic_parse_quic_bit(pkt.payload[0]);
@@ -1565,10 +1535,7 @@ bool QUICParser::quic_parse_initial(
 		DEBUG_MSG("Error, payload decryption failed (client side)\n");
 		return false;
 	}
-	initial_decrypted = true;
-	// AEAD verified: this Initial's packet number may now advance the reconstruction baseline
-	// (RFC 9000: "largest packet number successfully processed"). Doing this only after the tag
-	// check keeps a failed wrong-key attempt from poisoning the baseline.
+
 	if (current_initial_pn > largest_initial_pn) {
 		largest_initial_pn = current_initial_pn;
 	}
@@ -1580,8 +1547,6 @@ bool QUICParser::quic_parse_initial(
 		DEBUG_MSG("SNI and User Agent Extraction failed\n");
 		return false;
 	}
-	// Checked after the TLS parse on purpose: the parsed handshake type still lets
-	// quic_set_server_port() derive the direction from a partial ClientHello.
 	if (!quic_crypto_handshake_complete()) {
 		DEBUG_MSG("TLS handshake message incomplete in this Initial\n");
 		return false;

@@ -163,7 +163,9 @@ void QUICPlugin::set_cid_fields(
 	case 1:
 		set_stored_cid_fields(quic_data, new_quic_flow);
 
-		// `packets` counts server packets only; a Retry SCID is not the final server SCID
+		// set scid only if more non retry packets were sent by the server than retry packets.
+		// The retry SCID is not the final SCID. The final SCID is send by the server in the
+		// Initial.
 		if ((!quic_data->scid_set) && (quic_data->packet_from_server_seen)
 			&& (packets > quic_data->cnt_retry_packets)) {
 			process_quic->quic_get_dcid(quic_data->scid);
@@ -330,8 +332,8 @@ void QUICPlugin::set_client_hello_fields(
 				// already carry the server-chosen DCID (RFC 9000 7.2: the client switches to the
 				// server's SCID once it has processed a server packet, and again after a Retry),
 				// so quic_get_dcid() here would return the wrong value. orig_dcid stashes the
-				// first observed Initial's DCID and - unlike initial_dcid - is never touched
-				// again, including across a Retry.
+				// first observed Initial's DCID and is never touched again, including across a
+				// Retry.
 				if (quic_data->orig_dcid_set) {
 					memcpy(quic_data->oscid, quic_data->orig_dcid, quic_data->orig_dcid_length);
 					quic_data->oscid_length = quic_data->orig_dcid_length;
@@ -377,14 +379,14 @@ int QUICPlugin::process_quic(
 	bool new_quic_flow)
 {
 	QUICParser process_quic;
-	// Test for QUIC LH packet in UDP payload
+	// Initial keys are derived from the DCID of the client's first Initial, or from the SCID of
+	// the Retry the client confirmed. An unconfirmed Retry might never have reached the client, so
+	// its keys are only tried via the current packet's DCID inside the parser.
 	if (process_quic.quic_check_quic_long_header_packet(
 			pkt,
-			quic_data->initial_dcid,
-			quic_data->initial_dcid_length,
-			quic_data->quic_largest_initial_pn,
-			quic_data->orig_dcid,
-			quic_data->orig_dcid_length)) {
+			quic_data->retry_confirmed ? quic_data->retry_scid : quic_data->orig_dcid,
+			quic_data->retry_confirmed ? quic_data->retry_scid_length : quic_data->orig_dcid_length,
+			quic_data->quic_largest_initial_pn)) {
 		uint32_t version;
 		process_quic.quic_get_version(version);
 
@@ -433,17 +435,8 @@ int QUICPlugin::process_quic(
 		switch (process_quic.quic_get_packet_type()) {
 		case QUICParser::PACKET_TYPE::INITIAL:
 			process_quic.quic_get_parsed_initial(parsed_initial);
-			// Store DCID from first observed Initial packet. This is used in the crypto operations.
-			// Check length works because the first Initial must have a non-zero DCID.
-			if (quic_data->initial_dcid_length == 0) {
-				process_quic.quic_get_dcid_len(quic_data->initial_dcid_length);
-				process_quic.quic_get_dcid(quic_data->initial_dcid);
-			}
-			// Separately remember the DCID of the very first Initial permanently. Unlike
-			// initial_dcid above, a Retry (see PACKET_TYPE::RETRY below) repoints initial_dcid at
-			// the Retry's SCID so AEAD key derivation keeps working for the post-Retry Initial.
-			// OSCID export needs the original value, which orig_dcid_set protects from that
-			// overwrite.
+			// Store DCID from first observed Initial packet. It is never overwritten, also not by a
+			// Retry, and used for the OSCID export and the crypto operations.
 			if (!quic_data->orig_dcid_set) {
 				process_quic.quic_get_dcid_len(quic_data->orig_dcid_length);
 				process_quic.quic_get_dcid(quic_data->orig_dcid);
@@ -472,8 +465,6 @@ int QUICPlugin::process_quic(
 					memcpy(quic_data->retry_scid, dcid, dcid_len);
 					quic_data->retry_scid_length = dcid_len;
 					quic_data->quic_token_length = quic_data->retry_candidate_token_length[i];
-					memcpy(quic_data->initial_dcid, dcid, dcid_len);
-					quic_data->initial_dcid_length = dcid_len;
 					// Mark this Initial in QUIC_PACKETS as the one that adopted the Retry. Its
 					// entry was already written by set_packet_type() above.
 					const uint32_t pos = rec.src_packets + rec.dst_packets - 1;
@@ -484,20 +475,12 @@ int QUICPlugin::process_quic(
 				}
 			}
 
-			// Capture the token length from a client->server Initial of the flow. RFC 9000 only
-			// says a client SHOULD repeat the NEW_TOKEN/Retry token in every Initial, so a later
-			// CRYPTO-continuation fragment of a split ClientHello may carry an empty token.
-			// Recording it here - rather than only once the ClientHello finishes parsing
-			// (set_client_hello_fields()) - keeps the real value for reassembled ClientHellos and
-			// stops the uninitialized sentinel from being exported for flows whose ClientHello
-			// never reassembles. Retry packets set the token length separately below.
-			//
-			// Adopt the observed value when nothing was captured yet, or when we only saw an
-			// empty token so far and this Initial carries a real one. The latter covers a single
-			// 5-tuple that carries two QUIC connections (e.g. a resumption handshake reusing the
-			// client port): the first connection's ClientHello has no token, the resumption one
-			// presents the NEW_TOKEN token, and that non-zero length is the value worth exporting.
-			// A non-zero capture is never downgraded to 0 by a later (possibly tokenless) Initial.
+			// Capture the token length from every client->server Initial instead of only in
+			// set_client_hello_fields(). RFC 9000 only says a client SHOULD repeat the token in
+			// each Initial, so e.g. the last fragment of a split ClientHello may carry none and
+			// would otherwise overwrite the real length with 0 (or leave the unset sentinel if
+			// the ClientHello never reassembles). Adopt the observed value if nothing was captured
+			// yet or if it is non-zero; a later Initial without a token never resets it to 0.
 			if (toServer != 0 && quic_data->cnt_retry_packets == 0) {
 				uint64_t observed_token_length
 					= QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT;
@@ -588,14 +571,8 @@ int QUICPlugin::process_quic(
 		case QUICParser::PACKET_TYPE::RETRY:
 			quic_data->cnt_retry_packets += 1;
 			/*
-			 * A client MUST accept and process at most one Retry packet for each connection
-			 * attempt. After the client has received and processed an Initial or Retry packet from
-			 * the server, it MUST discard any subsequent Retry packets that it receives.
-			 *
-			 * A passive probe cannot tell which Retry that is until the client's next Initial
-			 * (see PACKET_TYPE::INITIAL above). Until then export the most recent Retry, e.g. the
-			 * one a flow ends with. Whether it was adopted is visible via F_RETRY_TOKEN_USED in
-			 * QUIC_PACKETS.
+			 * Export the latest Retry until the client confirms one (see PACKET_TYPE::INITIAL above).
+			 * Whether it was adopted is visible via F_RETRY_TOKEN_USED in QUIC_PACKETS.
 			 */
 			if (!quic_data->retry_confirmed) {
 				process_quic.quic_get_scid(quic_data->retry_scid);
@@ -604,11 +581,6 @@ int QUICPlugin::process_quic(
 			}
 
 			if (quic_data->cnt_retry_packets == 1) {
-				// Update DCID for decryption: post-Retry Initials are keyed off the Retry's SCID
-				// (RFC 9001 5.2), so both the length and the bytes must come from the SCID.
-				process_quic.quic_get_scid_len(quic_data->initial_dcid_length);
-				process_quic.quic_get_scid(quic_data->initial_dcid);
-
 				quic_data->crypto_range_count = 0;
 				quic_data->crypto_buffer_complete = false;
 				memset(quic_data->crypto_buffer, 0, sizeof(quic_data->crypto_buffer));
