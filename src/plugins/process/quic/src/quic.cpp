@@ -429,9 +429,6 @@ int QUICPlugin::process_quic(
 			return FLOW_FLUSH;
 		}
 
-		// export if parsed CH
-		quic_data->parsed_ch |= process_quic.quic_get_parsed_ch();
-
 		switch (process_quic.quic_get_packet_type()) {
 		case QUICParser::PACKET_TYPE::INITIAL:
 			process_quic.quic_get_parsed_initial(parsed_initial);
@@ -531,7 +528,8 @@ int QUICPlugin::process_quic(
 			}
 
 			if (parsed_initial && (process_quic.quic_get_tls_hs_type() == 1)) {
-				// Successful CH parsing
+				// Successful CH parsing (single-packet or reassembled)
+				quic_data->parsed_ch = 1;
 				set_stored_cid_fields(quic_data, new_quic_flow);
 				set_client_hello_fields(&process_quic, rec, quic_data, pkt, new_quic_flow);
 				quic_data->client_hello_seen = true;
