@@ -1,0 +1,113 @@
+name: quic-flow-compare
+
+# Compares the QUIC fields exported by ipfixprobe against tshark.
+# The test scripts live in https://github.com/tenksom/ipfixprobe-quic-flow-compare.
+
+on:
+  pull_request:
+    paths:
+      - "src/plugins/process/quic/**"
+      - ".github/workflows/quic-flow-compare.yml"
+  workflow_dispatch:
+    inputs:
+      testcases:
+        description: Interop runner test cases to download (space separated)
+        default: handshake handshakeloss handshakecorruption retry resumption zerortt v2 amplificationlimit
+
+jobs:
+  quic-flow-compare:
+    runs-on: ubuntu-latest
+    container: oraclelinux:10
+    defaults:
+      run:
+        shell: bash
+    env:
+      TOOLS: /opt/quic-flow-compare-tools
+      # Handshake-related, small test cases (~0.5 GB instead of >20 GB).
+      TESTCASES: ${{ inputs.testcases || 'handshake handshakeloss handshakecorruption retry resumption zerortt v2 amplificationlimit' }}
+      WIRESHARK_SSH_KEY: ${{ secrets.DEPLOY_KEY }}
+    steps:
+      - name: Install git
+        run: dnf install -y git
+
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Get test scripts
+        uses: actions/checkout@v4
+        with:
+          repository: tenksom/ipfixprobe-quic-flow-compare
+          path: quic-flow-compare
+
+      - name: Install ipfixprobe dependencies
+        uses: ./.github/actions/install-dependencies
+        with:
+          pcap: true
+
+      - name: Install test dependencies
+        run: quic-flow-compare/install-deps.sh
+
+      - name: Restore tshark and flowpipeline
+        id: tools
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TOOLS }}
+          key: quic-flow-compare-tools-${{ hashFiles('quic-flow-compare/build-tools.sh') }}
+
+      # The wireshark fork is private, see build-tools.sh.
+      - name: Build tshark and flowpipeline
+        if: steps.tools.outputs.cache-hit != 'true'
+        env:
+          WIRESHARK_TOKEN: ${{ secrets.WIRESHARK_TOKEN }}
+        run: quic-flow-compare/build-tools.sh "$TOOLS"
+
+      - name: Build ipfixprobe
+        run: |
+          cmake -S . -B build -DENABLE_INPUT_PCAP=ON
+          cmake --build build -j "$(nproc)"
+
+      # Runs as root in the container, so tcpdump needs no sudo.
+      - name: Configure test environment
+        run: |
+          echo "$TOOLS/bin" >> "$GITHUB_PATH"
+          echo "SUDO=" >> "$GITHUB_ENV"
+          echo "IPFIXPROBE=$GITHUB_WORKSPACE/build/src/core/ipfixprobe" >> "$GITHUB_ENV"
+          echo "PLUGIN_DIR=$GITHUB_WORKSPACE/build/src/plugins" >> "$GITHUB_ENV"
+
+      - name: Check tools
+        id: check-tools
+        working-directory: quic-flow-compare
+        run: make check-tools
+
+      # Interop results change with the implementations under test, so this
+      # step is informational and never fails the job.
+      - name: Latest interop runner pcaps
+        if: ${{ !cancelled() && steps.check-tools.outcome == 'success' }}
+        working-directory: quic-flow-compare
+        run: |
+          if ! ./get_new_data.sh latest interop; then
+            echo "Interop runner data not available, skipped." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          make -k -j "$(nproc)" compare PCAP_DIR=interop OUT_DIR=interop_processed RESULT_DIR=interop_results || true
+
+      - name: Summary
+        if: always()
+        working-directory: quic-flow-compare
+        run: |
+          if [ -d interop_results ]; then
+            {
+              echo "## Interop runner"
+              python3 summarize.py interop interop_results || true
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-flow-compare-results
+          path: |
+            quic-flow-compare/interop_results/
+            quic-flow-compare/interop_processed/pipeline_failed.log
+          if-no-files-found: ignore

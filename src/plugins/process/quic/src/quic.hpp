@@ -73,7 +73,7 @@ struct RecordExtQUIC : public RecordExt {
 	uint8_t occid_length;
 	uint8_t oscid_length;
 	uint8_t scid_length;
-	uint8_t initial_dcid_length;
+	uint8_t orig_dcid_length;
 	uint8_t dir_scid_length;
 	uint8_t dir_dcid_length;
 	uint8_t dir_scid_length2;
@@ -82,7 +82,9 @@ struct RecordExtQUIC : public RecordExt {
 	char occid[MAX_CID_LEN] = {0};
 	char oscid[MAX_CID_LEN] = {0};
 	char scid[MAX_CID_LEN] = {0};
-	char initial_dcid[MAX_CID_LEN] = {0};
+	// DCID of the very first Initial the client ever sent, never overwritten by a Retry. Exported
+	// as OSCID and used for Initial key derivation until a Retry is confirmed.
+	char orig_dcid[MAX_CID_LEN] = {0};
 	char retry_scid[MAX_CID_LEN] = {0};
 	// Intermediate storage when direction is not clear
 	char dir_scid[MAX_CID_LEN] = {0};
@@ -93,6 +95,15 @@ struct RecordExtQUIC : public RecordExt {
 	uint16_t dir_dport2;
 	uint16_t server_port;
 	uint8_t cnt_retry_packets;
+
+	// Every Retry sent by the server. A server may send several, but the client accepts at most
+	// one; its next Initial confirms which one. The confirmed one is exported and keys decryption.
+	static constexpr uint8_t MAX_RETRY_CANDIDATES = 4;
+	char retry_candidate_scid[MAX_RETRY_CANDIDATES][MAX_CID_LEN] = {};
+	uint8_t retry_candidate_scid_length[MAX_RETRY_CANDIDATES] = {};
+	uint64_t retry_candidate_token_length[MAX_RETRY_CANDIDATES] = {};
+	uint8_t retry_candidate_count = 0;
+	bool retry_confirmed = false;
 
 	uint8_t quic_multiplexed;
 	uint8_t quic_zero_rtt;
@@ -118,10 +129,22 @@ struct RecordExtQUIC : public RecordExt {
 	bool occid_set;
 	bool oscid_set;
 	bool scid_set;
+	bool orig_dcid_set;
 
 	bool client_version_set;
 	bool client_hello_seen;
 	bool packet_from_server_seen;
+
+	uint8_t crypto_buffer[QUIC_REASSEMBLE_BUFFER_SIZE];
+
+	static constexpr uint8_t MAX_CRYPTO_RANGES = 32;
+	CryptoRange crypto_ranges[MAX_CRYPTO_RANGES];
+	uint8_t crypto_range_count = 0;
+	bool crypto_buffer_complete = false;
+
+	// Largest client Initial packet number decrypted so far (RFC 9000, Appendix A.3). -1 = none
+	// yet.
+	int64_t quic_largest_initial_pn = -1;
 
 	RecordExtQUIC(int pluginID)
 		: RecordExt(pluginID)
@@ -154,6 +177,9 @@ struct RecordExtQUIC : public RecordExt {
 		quic_zero_rtt = 0;
 		memset(pkt_types, 0, sizeof(pkt_types));
 
+		memset(crypto_buffer, 0, sizeof(crypto_buffer));
+		crypto_range_count = 0;
+
 		memset(tls_ext_type, 0, sizeof(tls_ext_type));
 		tls_ext_type_len = 0;
 		tls_ext_type_set = false;
@@ -167,18 +193,30 @@ struct RecordExtQUIC : public RecordExt {
 		tls_ext_set = false;
 
 		last_pkt_type = 0;
-		initial_dcid[0] = 0;
-		initial_dcid_length = 0;
+		orig_dcid[0] = 0;
+		orig_dcid_length = 0;
 		parsed_ch = 0;
 
 		occid_set = false;
 		oscid_set = false;
 		scid_set = false;
+		orig_dcid_set = false;
 		client_version_set = false;
 		cnt_retry_packets = 0;
 
 		client_hello_seen = false;
 		packet_from_server_seen = false;
+	}
+
+	// quic_token_length keeps QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT as an
+	// internal "token length not observed yet" marker (see process_quic()). That sentinel must
+	// never reach the wire - a consumer would read it as a bogus length (e.g. its low 32 bits,
+	// 4294967295). Emit 0 instead, which matches "no token present".
+	uint64_t exported_token_length() const
+	{
+		return quic_token_length == QUICParser::QUIC_CONSTANTS::QUIC_UNUSED_VARIABLE_LENGTH_INT
+			? 0
+			: quic_token_length;
 	}
 
 #ifdef WITH_NEMEA
@@ -188,7 +226,7 @@ struct RecordExtQUIC : public RecordExt {
 		ur_set_string(tmplt, record, F_QUIC_USER_AGENT, user_agent);
 		ur_set(tmplt, record, F_QUIC_VERSION, quic_version);
 		ur_set(tmplt, record, F_QUIC_CLIENT_VERSION, quic_client_version);
-		ur_set(tmplt, record, F_QUIC_TOKEN_LENGTH, quic_token_length);
+		ur_set(tmplt, record, F_QUIC_TOKEN_LENGTH, exported_token_length());
 		ur_set_var(tmplt, record, F_QUIC_OCCID, occid, occid_length);
 		ur_set_var(tmplt, record, F_QUIC_OSCID, oscid, oscid_length);
 		ur_set_var(tmplt, record, F_QUIC_SCID, scid, scid_length);
@@ -254,7 +292,7 @@ struct RecordExtQUIC : public RecordExt {
 		pos += len_version;
 		*(uint32_t*) (buffer + pos) = htonl(quic_client_version);
 		pos += len_client_version;
-		*(uint64_t*) (buffer + pos) = htobe64(quic_token_length);
+		*(uint64_t*) (buffer + pos) = htobe64(exported_token_length());
 		pos += len_token_length;
 		// original client connection ID
 		pos += variable2ipfix_buffer(buffer + pos, (uint8_t*) occid, occid_length);
@@ -352,7 +390,7 @@ struct RecordExtQUIC : public RecordExt {
 			out << std::hex << std::setw(2) << std::setfill('0') << (uint16_t) tls_ext[i];
 		}
 		out << "\"";
-
+		out << "quictlsreassambled=\"" << crypto_buffer_complete << "\"";
 		return out.str();
 	}
 };
